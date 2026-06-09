@@ -1,0 +1,291 @@
+*azdo.txt*
+
+==============================================================================
+azdo.nvim                                                            *azdo*
+
+Work with Azure DevOps pull requests in Neovim. Wraps the Azure CLI (`az rest`
+for the Azure DevOps REST API, plus local `git` for diffs) in a minimalist yet
+effective workflow. A port of guh.nvim (GitHub) to Azure DevOps.
+
+Tenets:
+- Never lose data.
+- Work with buffers and PR data over REST; the only thing needing a local
+  checkout is the PR diff (Azure has no unified-diff endpoint).
+- All mappings work in all Azdo buffers ("azdo://…").
+
+==============================================================================
+INSTALLATION                                                     *azdo-install*
+
+Requirements:
+- Nvim 0.13+
+- Azure CLI ("az"), authenticated via `az login`: https://learn.microsoft.com/cli/azure/
+- The "azure-devops" extension: `az extension add --name azure-devops`
+- A local clone of the repo (for the PR diff).
+- (Optional) For highlighting diffs, use a plugin such as: https://github.com/barrettruth/diffs.nvim
+
+Auth uses your `az login` session; every REST call passes the Azure DevOps
+`--resource` audience. No PAT is required.
+
+Install: >lua
+  vim.pack.add{ 'https://github.com/<you>/azdo.nvim' }
+<
+
+==============================================================================
+WORKFLOW                                                           *azdo-usage*
+
+Azdo does not provide a setup() function. Instead it defines a plugin/azdo.lua
+file which Nvim automatically runs at startup. |lua-plugin-init|
+
+To review a PR without doing a checkout in your repo:
+
+- Run `:Azdo` to see your status (list of PRs, issues, etc.).
+  - Hit <Enter> or `CTRL-W<Enter>` on a PR/issue to view it.
+- Run `:Azdo [target]` to view a specific PR/issue. |azdo-commands|
+  - Hit `R` to refresh the view.
+- All "azdo://…" buffers have the same basic mappings. |azdo-mappings|
+- From the PR view, hit `dd` to see the diff. |azdo-diff|
+- PR comments are loaded:
+  - in a 'scrollbind' split window next to the diff window (if the
+    scrollbind gets out of sync, try |:syncbind|).
+  - as diagnostics on the diff buffer (severity INFO, source "azdo.nvim").
+    Navigate via |]d|/|[d|; peek with |CTRL-W_d|.
+  - in the quickfix list ("Azdo comments"). |]q| |[q| |:copen|
+- Hit `cc` or `:AzdoComment` to comment on a diff line.
+
+                                                                 *azdo-confirm*
+To confirm an action (such as "merge", "post comment", "approve", etc.) which
+accepts a (potentially optional) text input, Azdo presents a "azdo://…/edit".
+- To confirm the action, just save-and-close the buffer: `:wq`, `ZZ`, etc.
+- To cancel/abort the action, close-without-write (`:q!` or `ZQ`). Or if the
+  action requires non-empty content, writing an empty buffer will also abort.
+
+
+------------------------------------------------------------------------------
+Keymaps                                                         *azdo-mappings*
+
+Azdo defines global `<Plug>(azdo-…)` keys at startup. You can map anything to
+those |<Plug>| keys to "override" the default Azdo keymaps. When a `azdo://`
+buffer is opened it sets buffer-local default mappings unless you have defined
+such an override.
+
+Example: the `<Plug>(azdo-merge)` feature is mapped to "cM" by default, but you
+can override it by mapping it to <F5>, then Azdo will not map "cM": >vim
+  nmap <F5> <Plug>(azdo-merge)
+<
+Default mappings (local to `azdo://` buffers):
+
+- Buffer-relative VIEW actions:
+  - `R` Refresh the current `azdo://` buffer.
+    <Plug>(azdo-refresh)
+  - `dd` View PR diff + comments. |azdo-diff|
+    <Plug>(azdo-diff)
+  - `dl` View the most-recent CI logs for all job-names in the CI matrix.
+    <Plug>(azdo-logs)
+  - `]f` View the next PR commit (from the most-recent push).
+    <Plug>(azdo-next-commit)
+  - `[f` View the previous PR commit (from the most-recent push).
+    <Plug>(azdo-prev-commit)
+  - `g?` View this help section.
+    <Plug>(azdo-help)
+- Buffer-relative UPDATE actions:
+  - `cC` Comment on the PR/issue (top-level). |azdo-comment|
+    <Plug>(azdo-comment-overview)
+  - `cM` Merge PR. |azdo-merge|
+    <Plug>(azdo-merge)
+  - `cR` Review PR: approve / comment / request-changes (sets reviewer vote).
+    <Plug>(azdo-review)
+  - `c:` Edit PR title/description (work items open in the browser).
+    <Plug>(azdo-edit)
+- Cursor-relative actions:
+  - `<Enter>` invokes |:Azdo| on the |WORD| at cursor.
+    <Plug>(azdo-open)
+  - `CTRL-W<Enter>` invokes |:Azdo| on the |WORD| at cursor, in a split window.
+    <Plug>(azdo-open-split)
+  - `cc` (or `c` in Visual mode): Comment on a diff-line. |azdo-comment|
+    In a `azdo://…/prcomments/` buffer, edits the comment at cursor.
+    <Plug>(azdo-comment)
+  - `cr` (or `c` in Visual mode): Reply-to/Resolve a thread. |azdo-comment|
+    In a `azdo://…/prcomments/` buffer, acts upon thread at cursor.
+    <Plug>(azdo-comment)
+
+
+------------------------------------------------------------------------------
+View PR diff                                                        *azdo-diff*
+
+`dd` on a PR view opens the diff + comments in 'scrollbind' split windows.
+
+- OUTDATED diffs (if any) are shown as extra diff section above the "current"
+  diff, if any UNRESOLVED comments are anchored thereto.
+- Unresolved comments on OUTDATED code (i.e. code from an old push), are
+  attached to diff-hunks with filename format `outdated-<id>:<file>`.
+- UNRESOLVED comments on code OUTSIDE of the PR diff, are similarly attached
+  to diff-hunks with filename format `outside-<id>:<file>`.
+- The current, latest diff follows those quasi-diffs, and is always shown.
+- Only UNRESOLVED comments are shown.
+- Note: Azure DevOps exposes no per-file "Viewed" state via its API, so the
+  VIEWED-file collapsing below is effectively inert (nothing is collapsed).
+
+PR diff:
+
+- Lists diff-hunks in this order:
+  1. Outdated (only if unresolved comments)
+  2. Outside (only if unresolved comments)
+  3. Current
+- Shows VIEWED files as a single line (diff/comments not loaded): >
+  (viewed) path/to/file
+<
+- The diff overlay shows: >
+  PR diff (Viewed files: 3/12, Resolved comments: 4/20).
+<
+- Refresh ("R") to update after marking/unmarking a file as VIEWED.
+
+PR comments:
+
+- in a 'scrollbind' split window next to the diff window (if the scrollbind
+  gets out of sync, try |:syncbind|).
+- when multiple comments anchor to the same diff line, every comment's
+  heading row is guaranteed; the remaining vertical budget is filled with
+  comment bodies in-order. If a comment can't fit, it shows `(truncated)`. The
+  full comment is always accessible via the diagnostic peek (`<C-w>d`) or the
+  quickfix list.
+- as diagnostics on the diff buffer (severity INFO, source "azdo.nvim"):
+  - Navigate using `vim.diagnostic.jump` (|]d| |[d|).
+  - See comment details using `<C-w>d` |CTRL-W_d-default|.
+- in the quickfix list ("Azdo comments") via |vim.diagnostic.setqflist()|.
+  Use |]q|/|[q| or |:copen| to browse.
+
+------------------------------------------------------------------------------
+Comment on issues, PRs, and diffs                                *azdo-comment*
+
+`cc` on a PR diff-line, or on an existing comment, opens an editable
+`azdo://…/comment/<id>` buffer. Write-and-close to post the comment. |azdo-confirm|
+
+`cr` on a comment (thread), presents a menu:
+1. Reply
+2. Resolve
+
+See |:AzdoComment|.
+
+------------------------------------------------------------------------------
+Merging PRs                                                        *azdo-merge*
+
+`cM` on a PR view opens a picker:
+- 1. squash
+- 2. merge
+- 3. rebase
+- 4. squash --admin (bypass branch protections)
+- 5. merge --admin (bypass branch protections)
+- 6. rebase --admin (bypass branch protections)
+
+`[count]cM` skips the picker (e.g. `1cM` = squash, `5cM` = merge --admin).
+
+"merge" maps to the noFastForward strategy, "squash" to squash, "rebase" to
+rebase. `--admin` sets `bypassPolicy` to complete past branch policies.
+
+For "squash" and "merge", Azdo presents a `azdo://…/merge/<id>` buffer,
+prefilled with the PR title and body (first line = subject, rest = body) used
+as the merge-commit message. Write-and-close to complete the PR. |azdo-confirm|
+
+------------------------------------------------------------------------------
+Review PRs: approve, request changes, or reject                   *azdo-review*
+
+`cR` on a PR view opens a picker ("approve"/"request-changes"/"comment").
+`[count]cR` skips the picker:
+- `1cR` = approve
+- `2cR` = comment
+- `3cR` = request-changes
+
+To confirm the "review" action, Azdo presents a `azdo://…/review/<id>` buffer.
+Write-and-close to confirm the "review" action. |azdo-confirm|
+
+==============================================================================
+COMMANDS                                                        *azdo-commands*
+
+:Azdo [target]                                                           *:Azdo*
+
+Views or reloads the given [target], or shows a status if [target] is not
+given (or is a repo). Accepts |<mods>|: >
+
+    :vertical Azdo …
+    :horizontal Azdo …
+    :tab Azdo …
+
+If |<mods>| is not given, the existing window for [target] (if any) is
+focused.
+
+Without [target]: shows a status dashboard listing the repo's active PRs
+(for the current `azdo://` buffer's repo or the |current-directory|'s repo).
+Hit <Enter> or `CTRL-W<Enter>` on a `#id` to view that PR. |azdo-mappings|
+
+A numeric [target] is probed: an existing PR id opens the PR; otherwise it is
+treated as a work-item id.
+
+With [target]: views or refreshes the PR, work-item, commit, or repo-status:
+- PR or work-item number (current repo): `:Azdo 42`
+- Commit SHA (current repo): `:Azdo a1b2c3d`
+- PR URL: `:Azdo https://dev.azure.com/org/project/_git/repo/pullrequest/42`
+- Commit URL: `:Azdo https://dev.azure.com/org/project/_git/repo/commit/a1b2c3d`
+- Work-item URL: `:Azdo https://dev.azure.com/org/project/_workitems/edit/42`
+- Bare repo URL (status view): `:Azdo https://dev.azure.com/org/project/_git/repo`
+- Azdo buffer name: `:Azdo azdo://org/project/repo/pr/42`
+- Slug ("org/project/repo#42" or repo-only "org/project/repo") >
+    :Azdo org/project/repo#42
+    :Azdo #42
+    :Azdo org/project/repo
+<
+For a PR target, `:Azdo` loads the pr/ + prdiff/ + prcomments/ views.
+The pr/ view becomes the |alternate-file| of the prdiff/ view (so `CTRL-^`
+returns to it).
+
+Commits are shown as a |ft-gitcommit-plugin| buffer (via local `git show`).
+<Enter> on a SHA in any `azdo://` buffer opens that commit.
+
+:[range]AzdoComment                                               *:AzdoComment*
+
+Creates, updates, or deletes a comment. >
+
+    :.AzdoComment
+    :'<,'>AzdoComment
+
+Use range "%" to create a top-level comment on the current PR/issue: >
+
+    :%AzdoComment
+
+Use bang "!" with a single-line [range] to delete a comment: >
+
+    :.AzdoComment!
+<
+
+==============================================================================
+HIGHLIGHTS                                                    *azdo-highlights*
+
+Azdo defines these highlight groups (with `default = true`, so a colorscheme
+that defines them wins). Link or `:hi` them to customize.
+
+AzdoHeading
+    Heading for comment-threads and various other headings.
+
+AzdoWarning
+    Hints such as `(outdated)`, `(outside)`, `(truncated)`, `(viewed)` in
+    `azdo://` buffers.
+
+==============================================================================
+DEVELOPMENT                                                          *azdo-dev*
+
+Enable debug logging: >lua
+
+    vim.g.azdo_debug = true
+
+View the logs: >
+
+    :log azdo
+
+The log file is `stdpath('log')/azdo.log`.
+
+Run the tests (self-contained; just needs `nvim` on PATH): >
+
+    make test
+
+
+------------------------------------------------------------------------------
+vim:tw=78:ts=8:sw=4:et:ft=help:norl:

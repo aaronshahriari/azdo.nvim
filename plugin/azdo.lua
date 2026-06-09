@@ -1,0 +1,74 @@
+vim.api.nvim_set_hl(0, 'AzdoHeading', { default = true, link = 'PmenuSel' })
+vim.api.nvim_set_hl(0, 'AzdoWarning', { default = true, link = 'WarningMsg' })
+
+local group = vim.api.nvim_create_augroup('azdo.keymaps', { clear = true })
+
+-- ":edit azdo://org/project/repo/pr/N" (etc.) dispatches to :Azdo.
+-- Wipe the placeholder buffer that :edit created.
+vim.api.nvim_create_autocmd('BufReadCmd', {
+  pattern = 'azdo://*',
+  group = group,
+  callback = function(args)
+    local uri = args.match
+    vim.schedule(function()
+      if vim.api.nvim_buf_is_valid(args.buf) then
+        vim.api.nvim_buf_delete(args.buf, { force = true })
+      end
+      vim.cmd('Azdo ' .. vim.fn.fnameescape(uri))
+    end)
+  end,
+})
+
+-- :syncbind the prdiff/prcomments windows.
+vim.api.nvim_create_autocmd({ 'WinEnter', 'WinResized' }, {
+  pattern = { 'azdo://*/prdiff/*', 'azdo://*/prcomments/*' },
+  group = group,
+  command = 'keepjumps syncbind',
+})
+
+vim.api.nvim_create_user_command('Azdo', function(args)
+  require('azdo.pr').select(args)
+end, { nargs = '?' })
+vim.api.nvim_create_user_command('AzdoComment', function(args)
+  require('azdo.pr').comment(args)
+end, { bang = true, range = true })
+
+local opts = { silent = true }
+vim.keymap.set('n', '<Plug>(azdo-review)', function()
+  require('azdo.pr').review_pr()
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-merge)', function()
+  require('azdo.pr').merge_pr()
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-edit)', function()
+  require('azdo.pr').edit_pr()
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-comment)', '<cmd>AzdoComment<cr>', opts)
+-- Use ":" in Visual mode so the `'<,'>` range is passed to the command.
+vim.keymap.set('x', '<Plug>(azdo-comment)', ':AzdoComment<cr>', opts)
+vim.keymap.set('n', '<Plug>(azdo-comment-overview)', '<cmd>%AzdoComment<cr>', opts)
+vim.keymap.set('n', '<Plug>(azdo-thread)', function()
+  require('azdo.comments').reply_or_resolve(vim.fn.line('.'))
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-diff)', function()
+  require('azdo.pr').show_pr_diff()
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-logs)', function()
+  require('azdo.pr').show_ci_logs()
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-help)', '<cmd>help azdo-mappings<cr>', opts)
+vim.keymap.set('n', '<Plug>(azdo-refresh)', function()
+  require('azdo.pr').refresh()
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-open)', function()
+  vim.cmd.Azdo(vim.fn.expand('<cWORD>'))
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-open-split)', function()
+  vim.api.nvim_cmd({ cmd = 'Azdo', args = { vim.fn.expand('<cWORD>') }, mods = { horizontal = true } }, {})
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-next-commit)', function()
+  require('azdo.pr').show_next_commit(1)
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-prev-commit)', function()
+  require('azdo.pr').show_next_commit(-1)
+end, opts)

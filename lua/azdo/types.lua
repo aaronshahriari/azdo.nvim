@@ -1,0 +1,77 @@
+--- @alias Feat 'comment'|'commit'|'edit'|'issue'|'logs'|'merge'|'pr'|'prcomments'|'prdiff'|'review'|'status'
+
+--- @class BufState
+--- Buffer-local b:azdo dict.
+--- @field id? integer|string PR or issue number, or commit SHA.
+--- @field feat? Feat Feature name
+--- @field pr_data? PullRequest
+
+--- @class Comment
+--- @field body string
+--- @field diff_hunk string Synthetic single-line hunk (Azure exposes no hunk snippet); used for off-diff rendering.
+--- @field end_line number End of comment range (1-indexed file-line; `rightFileEnd`/`leftFileEnd`).
+--- @field end_bufline? integer End of _rendered_ comment range (1-indexed "prdiff" buffer-line). See `start_bufline`.
+--- @field id number Globally-unique synthetic id (`thread_id * 1e6 + comment_id`).
+--- @field comment_id? integer Real Azure per-thread comment id (for REST routes).
+--- @field path string For `outdated`/`outside`: a synthetic key `<kind>-<thread_id>:<real_path>`.
+--- @field side? 'LEFT'|'RIGHT' Diff side the comment anchors to. LEFT = deleted-line/old file, RIGHT = added/context/new file.
+--- @field start_line number Start of comment range (1-indexed file-line; `rightFileStart`/`leftFileStart`).
+--- @field start_bufline? integer Start of _rendered_ comment range (1-indexed "prdiff" buffer-line). Populated at render time.
+--- @field updated_at string
+--- @field url string
+--- @field user string|table `{ login = displayName }` before marshaling; `displayName` after.
+--- @field outdated? boolean true if the thread is anchored to stale code.
+--- @field thread_id? number Azure PR thread id.
+--- @field thread_node_id? string Azure PR thread id as a string. Needed by the resolve-thread route.
+
+--- @class CommentThread
+--- @field comments Comment[]
+--- @field id number
+--- @field end_line number End of thread range (1-indexed GitHub file-line). = head comment's `end_line`.
+--- @field start_line number Start of thread range (1-indexed GitHub file-line).
+--- @field url string
+
+--- @class FileNameAndLinePair
+--- @field [1] string filename
+--- @field [2] number line
+
+--- @class Issue
+--- @field author table
+--- @field body string
+--- @field createdAt string
+--- @field labels table
+--- @field number number
+--- @field state string
+--- @field title string
+--- @field updatedAt string
+--- @field url string
+
+--- @class PRCommit
+--- @field oid string
+--- @field messageHeadline string
+--- @field messageBody string
+--- @field authors table[]
+
+--- @class PullRequest PR data marshaled by `az.get_pr_data`.
+--- @field author table `{ login = displayName }`
+--- @field baseRefName string Target branch (short name).
+--- @field baseRefOid string Target last-merge commit id.
+--- @field body string PR description.
+--- @field changedFiles number
+--- @field commits PRCommit[]
+--- @field createdAt string
+--- @field headRefName string Source branch (short name).
+--- @field headRefOid string Source last-merge commit id.
+--- @field isDraft boolean
+--- @field labels table
+--- @field number number pullRequestId
+--- @field reviewDecision string Derived from reviewer votes (APPROVED/CHANGES_REQUESTED/REVIEW_REQUIRED).
+--- @field reviews { login: string, vote: integer }[]
+--- @field status? string Azure PR status (active/completed/abandoned).
+--- @field title string
+--- @field url string Web url.
+--- @field raw_comments Comment[] Flat per-comment list from `flatten_threads`.
+--- @field general { user: string, updated_at: string, body: string }[] General (non-file) discussion.
+--- @field viewed table<string, boolean> Always empty (Azure has no API "Viewed" state).
+--- @field n_threads integer Total file-anchored thread count (resolved + unresolved).
+--- @field n_resolved integer Resolved thread count.
