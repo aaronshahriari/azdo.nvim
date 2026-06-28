@@ -311,8 +311,19 @@ local KEYMAP_SPEC = {
   },
 
   -- "Local" (cursor-relative) actions:
-  { name = 'comment', plug = '<Plug>(azdo-comment)', desc = 'Comment on PR or diff' },
-  { name = 'comment_visual', mode = 'x', plug = '<Plug>(azdo-comment)', desc = 'Comment on PR or diff' },
+  {
+    name = 'comment',
+    plug = '<Plug>(azdo-comment)',
+    desc = 'Comment on PR or diff',
+    feats = { pr = true, prdiff = true, prcomments = true },
+  },
+  {
+    name = 'comment_visual',
+    mode = 'x',
+    plug = '<Plug>(azdo-comment)',
+    desc = 'Comment on PR or diff',
+    feats = { pr = true, prdiff = true, prcomments = true },
+  },
   { name = 'thread', plug = '<Plug>(azdo-thread)', desc = 'Reply-to or Resolve a comment thread' },
   { name = 'comment_delete', plug = '<Plug>(azdo-comment-delete)', desc = 'Delete a comment (prompts to confirm)' },
   { name = 'comment_update', plug = '<Plug>(azdo-comment-update)', desc = 'Update/edit a comment' },
@@ -339,6 +350,30 @@ local KEYMAP_SPEC = {
     name = 'tag_toggle',
     plug = '<Plug>(azdo-tag-toggle)',
     desc = 'Tag/untag the work item under the cursor',
+    feats = { workitems = true },
+  },
+  {
+    name = 'sort',
+    plug = '<Plug>(azdo-sort)',
+    desc = 'Sort the work-items dashboard (picks a field)',
+    feats = { workitems = true },
+  },
+  {
+    name = 'set_state',
+    plug = '<Plug>(azdo-set-state)',
+    desc = "Set the work item's state (picks from its type's states)",
+    feats = { workitems = true, issue = true },
+  },
+  {
+    name = 'toggle_hidden',
+    plug = '<Plug>(azdo-toggle-hidden)',
+    desc = 'Show/hide the dashboard\'s hidden states (items.hide_states)',
+    feats = { workitems = true },
+  },
+  {
+    name = 'assignee',
+    plug = '<Plug>(azdo-assignee)',
+    desc = 'Filter the dashboard by assignee (All / you / pick people)',
     feats = { workitems = true },
   },
 }
@@ -471,6 +506,120 @@ function M.show_winbar(win, chunks)
     end
   end
   vim.wo[win].winbar = table.concat(parts)
+end
+
+--- A small centered, markdown-styled multi-select popup. Each item is
+--- `{ label = string, checked? = boolean, exclusive? = boolean }`; toggling an
+--- `exclusive` item on clears the rest, and toggling any normal item on clears
+--- the exclusive ones (so e.g. an "All" entry can't coexist with specific picks).
+--- Keys: `<Space>`/`<Tab>` toggle the line under the cursor, `<CR>` applies,
+--- `q`/`<Esc>` (or leaving the float) cancels.
+---
+--- @param opts { title?: string, items: { label: string, checked?: boolean, exclusive?: boolean }[] }
+--- @param cb fun(selected?: integer[]) indices (into opts.items) of checked items, or nil if cancelled.
+function M.multiselect(opts, cb)
+  opts = opts or {}
+  local items = opts.items or {}
+  if #items == 0 then
+    M.msg('azdo: nothing to choose from')
+    return cb(nil)
+  end
+
+  local HEADER = 3 -- title, blank, help — items start at HEADER+1
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = 'wipe'
+
+  local function render()
+    local lines = {
+      '# ' .. (opts.title or 'Select'),
+      '',
+      '`<Space>` toggle · `<CR>` apply · `q` cancel',
+    }
+    for _, it in ipairs(items) do
+      lines[#lines + 1] = ('- [%s] %s'):format(it.checked and 'x' or ' ', it.label)
+    end
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+    vim.bo[buf].filetype = 'markdown'
+  end
+
+  local width = 50
+  for _, it in ipairs(items) do
+    width = math.max(width, #it.label + 8)
+  end
+  width = math.min(width, math.max(40, vim.o.columns - 8))
+  local height = math.min(#items + HEADER, math.max(8, vim.o.lines - 6))
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = 'editor',
+    width = width,
+    height = height,
+    row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1),
+    col = math.floor((vim.o.columns - width) / 2),
+    style = 'minimal',
+    border = 'rounded',
+    title = ' azdo ',
+    title_pos = 'center',
+  })
+  vim.wo[win].cursorline = true
+  render()
+  vim.api.nvim_win_set_cursor(win, { HEADER + 1, 0 })
+
+  local done = false
+  local function finish(result)
+    if done then
+      return
+    end
+    done = true
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+    cb(result)
+  end
+
+  local function toggle()
+    local idx = vim.api.nvim_win_get_cursor(win)[1] - HEADER
+    local it = items[idx]
+    if not it then
+      return
+    end
+    it.checked = not it.checked
+    if it.checked then
+      for j, other in ipairs(items) do
+        -- exclusive on → clear everyone else; normal on → clear the exclusives.
+        if (it.exclusive and j ~= idx) or (not it.exclusive and other.exclusive) then
+          other.checked = false
+        end
+      end
+    end
+    render()
+  end
+
+  local kopts = { buffer = buf, nowait = true, silent = true }
+  vim.keymap.set('n', '<Space>', toggle, kopts)
+  vim.keymap.set('n', '<Tab>', toggle, kopts)
+  vim.keymap.set('n', '<CR>', function()
+    local sel = {}
+    for i, it in ipairs(items) do
+      if it.checked then
+        sel[#sel + 1] = i
+      end
+    end
+    finish(sel)
+  end, kopts)
+  vim.keymap.set('n', 'q', function()
+    finish(nil)
+  end, kopts)
+  vim.keymap.set('n', '<Esc>', function()
+    finish(nil)
+  end, kopts)
+  vim.api.nvim_create_autocmd('BufLeave', {
+    buffer = buf,
+    once = true,
+    callback = function()
+      finish(nil)
+    end,
+  })
 end
 
 return M

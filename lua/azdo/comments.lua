@@ -138,9 +138,9 @@ function M.show_pr_comments(id, repo, diff_win, comments_list, viewed, n_files, 
   if not state.try_show('prcomments', repo, id) then
     -- TODO: should state.init_buf() handle this? maybe helpful for <mods> handling on :Azdo too?
     vim.cmd [[botright vertical split]]
-    -- Width of the comments split. `comments_width` is a percentage (1–99) of
-    -- the editor width; unset/invalid leaves Vim's 50% default.
-    local pct = tonumber(require('azdo.config').options.comments_width)
+    -- Width of the comments split. `pr.comments.width` is a percentage (1–99)
+    -- of the editor width; unset/invalid leaves Vim's 50% default.
+    local pct = tonumber(((require('azdo.config').options.pr or {}).comments or {}).width)
     if pct and pct > 0 and pct < 100 then
       vim.api.nvim_win_set_width(0, math.floor(vim.o.columns * pct / 100))
     end

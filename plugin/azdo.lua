@@ -38,8 +38,8 @@ end, {})
 vim.api.nvim_create_user_command('AzdoLink', function()
   require('azdo.pr').link_workitem()
 end, {})
-vim.api.nvim_create_user_command('AzdoMenu', function()
-  require('azdo.menu').open()
+vim.api.nvim_create_user_command('AzdoMenu', function(args)
+  require('azdo.menu').open({ mods = args.mods })
 end, {})
 
 local opts = { silent = true }
@@ -63,6 +63,18 @@ vim.keymap.set('n', '<Plug>(azdo-link)', function()
 end, opts)
 vim.keymap.set('n', '<Plug>(azdo-tag-toggle)', function()
   require('azdo.pr').tag_toggle()
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-sort)', function()
+  require('azdo.pr').sort_workitems()
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-set-state)', function()
+  require('azdo.pr').set_state()
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-toggle-hidden)', function()
+  require('azdo.pr').toggle_hidden()
+end, opts)
+vim.keymap.set('n', '<Plug>(azdo-assignee)', function()
+  require('azdo.pr').filter_assignee()
 end, opts)
 vim.keymap.set('n', '<Plug>(azdo-comment)', '<cmd>AzdoComment<cr>', opts)
 -- Use ":" in Visual mode so the `'<,'>` range is passed to the command.
@@ -101,7 +113,19 @@ vim.keymap.set('n', '<Plug>(azdo-open)', function()
   vim.cmd.Azdo(vim.fn.expand('<cWORD>'))
 end, opts)
 vim.keymap.set('n', '<Plug>(azdo-open-split)', function()
-  vim.api.nvim_cmd({ cmd = 'Azdo', args = { vim.fn.expand('<cWORD>') }, mods = { horizontal = true } }, {})
+  local items = require('azdo.config').options.items or {}
+  local vertical = (items.split or 'vertical') ~= 'horizontal'
+  vim.api.nvim_cmd({
+    cmd = 'Azdo',
+    args = { vim.fn.expand('<cWORD>') },
+    mods = vertical and { vertical = true } or { horizontal = true },
+  }, {})
+  -- `:Azdo` created (and focused) the split synchronously; size it now.
+  local size = items.size
+  if type(size) == 'number' and size > 0 and size < 100 then
+    local total = vertical and vim.o.columns or vim.o.lines
+    vim.cmd((vertical and 'vertical resize ' or 'resize ') .. math.floor(total * size / 100 + 0.5))
+  end
 end, opts)
 vim.keymap.set('n', '<Plug>(azdo-next-commit)', function()
   require('azdo.pr').show_next_commit(1)

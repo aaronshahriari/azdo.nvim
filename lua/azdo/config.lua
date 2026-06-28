@@ -35,10 +35,81 @@ M.defaults = {
   --- @type boolean
   create_in_tab = true,
 
-  --- PR comments split width, as a percentage (1-99) of the editor width.
-  --- nil keeps Vim's 50% default.
-  --- @type number?
-  comments_width = nil,
+  --- PR-view settings (the `pr` / `prdiff` / `prcomments` buffers).
+  --- @class azdo.Config.pr
+  pr = {
+    --- The PR diff + comments split.
+    --- @class azdo.Config.pr.comments
+    comments = {
+      --- Width of the comments pane, as a percentage (1-99) of the editor
+      --- width. nil keeps Vim's 50% default.
+      --- @type number?
+      width = nil,
+    },
+  },
+
+  --- The `:Azdo items` work-items dashboard, and how `open_split` opens the
+  --- PR / work item under the cursor. |<Plug>(azdo-open-split)|
+  --- @class azdo.Config.items
+  items = {
+    --- Split direction: 'vertical' (side-by-side) or 'horizontal' (above/below).
+    --- @type 'vertical'|'horizontal'
+    split = 'vertical',
+
+    --- Split size, as a percentage (1-99) of the editor. For a vertical split
+    --- this is the new window's width; for horizontal, its height. nil keeps
+    --- Vim's default (an even split).
+    --- @type number?
+    size = nil,
+
+    --- Default sort for the `:Azdo items` dashboard. One of 'changed',
+    --- 'created', 'id', 'title', 'type', 'state', 'assignee' (a trailing
+    --- " date" is allowed, e.g. 'created date'). Date sorts are newest-first.
+    --- Change it interactively with the `sort` keymap (default `s`).
+    --- @type string
+    sort = 'changed',
+
+    --- Group the dashboard under `###` subheadings derived from the sort: by
+    --- day for date sorts, by state (in workflow/board order) for the 'state'
+    --- sort, by type/assignee for those. 'id' and 'title' are never grouped.
+    --- false renders a flat list. The `sort` picker can also toggle this.
+    --- @type boolean
+    group = true,
+
+    --- Fold the dashboard's groups closed by default (only applies when
+    --- grouping is on). `false` = all open, `true` = all closed, or a list of
+    --- group labels (typically state names, case-insensitive) to start folded
+    --- while the rest stay open — e.g. `{ 'Done' }` to collapse finished work
+    --- without hiding it. Expand with the standard fold keys: `za` toggles the
+    --- group under the cursor, `zR` opens all, `zM` closes all.
+    --- @type boolean|string[]
+    fold = false,
+
+    --- Who the dashboard lists. 'me' (default) = items assigned to you (`@Me`).
+    --- 'all' = everyone's active items. A name string = one person (matched on
+    --- display name or unique name, e.g. "Aaron Shahriari"). A list of names =
+    --- several people (OR'd). Change it at runtime with the `assignee` keymap
+    --- (default `ga`), which pops a multi-select of the project's active
+    --- assignees; the choice sticks across refreshes.
+    --- @type 'me'|'all'|string|string[]
+    assignee = 'me',
+
+    --- The roster offered by the `assignee` picker (default `ga`). A list of
+    --- names (display name or unique name / email) you filter by often, e.g.
+    --- `{ 'Aaron Shahriari', 'Jane Doe' }`. When set, the picker shows exactly
+    --- "All assignees", "Me", and these — instantly, with no extra query. Leave
+    --- it empty/nil to instead derive the roster from the project's recently
+    --- active work items (one bounded query). |azdo-workitems|
+    --- @type string[]?
+    assignees = nil,
+
+    --- Work-item states to hide from the active list, case-insensitive, e.g.
+    --- `{ 'Done' }` (the WIQL already drops Closed/Removed). Hidden items are
+    --- filtered out before grouping and their count is shown in the header;
+    --- reveal them at runtime with the `toggle_hidden` keymap (default `gh`).
+    --- @type string[]
+    hide_states = {},
+  },
 
   --- Log REST calls to `stdpath('log')/azdo.log`.
   --- @type boolean
@@ -89,6 +160,10 @@ M.defaults = {
     next_comment = ']c',
     prev_comment = '[c',
     tag_toggle = 't',
+    sort = 's',
+    set_state = 'cc',
+    toggle_hidden = 'gh',
+    assignee = 'ga',
   },
 
   --- Optional global mapping for the `:AzdoMenu` command palette, e.g.
@@ -118,6 +193,14 @@ function M.setup(opts)
   if opts.workitem_sections then
     merged.workitem_sections = vim.tbl_extend('force', vim.deepcopy(M.defaults.workitem_sections), opts.workitem_sections)
   end
+
+  -- Backward-compat: the flat `comments_width` moved under `pr.comments.width`.
+  -- Honor the old key (unless `pr.comments.width` was set explicitly).
+  local explicit = opts.pr and opts.pr.comments and opts.pr.comments.width
+  if opts.comments_width ~= nil and explicit == nil then
+    merged.pr.comments.width = opts.comments_width
+  end
+  merged.comments_width = nil
 
   M.options = merged
   return M.options

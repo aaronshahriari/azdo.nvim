@@ -12,8 +12,11 @@
 local M = {}
 
 --- The actions shown in the palette (source of truth for `:AzdoMenu`).
+--- @param mods string|nil Command modifiers to apply to dashboard-opening
+---   actions (e.g. `'tab'` so `:tab AzdoMenu` opens the result in a new tab).
 --- @return table[]
-local function catalog()
+local function catalog(mods)
+  local pfx = (mods and mods ~= '') and (mods .. ' ') or ''
   return {
     {
       id = 'status',
@@ -21,7 +24,7 @@ local function catalog()
       desc =
       'Open the status dashboard for the current repo: your open PRs and the PRs awaiting your review. (`:Azdo`)',
       run = function()
-        vim.cmd('Azdo')
+        vim.cmd(pfx .. 'Azdo')
       end,
     },
     {
@@ -30,7 +33,7 @@ local function catalog()
       desc =
       'Open the work-items dashboard for items assigned to you. Needs the `project` option to work outside a repo. (`:Azdo items`)',
       run = function()
-        vim.cmd('Azdo items')
+        vim.cmd(pfx .. 'Azdo items')
       end,
     },
     {
@@ -59,9 +62,10 @@ local function catalog()
 end
 
 --- The actions available in the palette.
+--- @param mods string|nil Command modifiers to bake into dashboard actions.
 --- @return table[]
-function M.available()
-  return catalog()
+function M.available(mods)
+  return catalog(mods)
 end
 
 --- Run an action.
@@ -75,8 +79,13 @@ end
 --- Open the command palette via `vim.ui.select` (so it flows through whatever
 --- `vim.ui.select` handler is installed — Telescope, fzf-lua, snacks, or the
 --- builtin). Bound to `:AzdoMenu` and `<Plug>(azdo-menu)`.
-function M.open()
-  local items = M.available()
+---
+--- The dashboard actions inherit `opts.mods`, so `:tab AzdoMenu` opens the
+--- chosen dashboard in a new tab — and, crucially, the tab is created only when
+--- you pick something, not when the palette opens. Cancelling leaves no tab.
+--- @param opts table|nil { mods?: string }
+function M.open(opts)
+  local items = M.available((opts or {}).mods)
   if #items == 0 then
     return
   end

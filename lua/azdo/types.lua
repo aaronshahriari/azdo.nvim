@@ -5,6 +5,9 @@
 --- @field id? integer|string PR or issue number, or commit SHA.
 --- @field feat? Feat Feature name
 --- @field pr_data? PullRequest
+--- @field sort? string Current work-items dashboard sort (a WI_SORTS key).
+--- @field group? boolean Current work-items dashboard grouping (subheadings on/off).
+--- @field show_hidden? boolean Reveal states normally hidden by items.hide_states.
 
 --- @class Comment
 --- @field body string

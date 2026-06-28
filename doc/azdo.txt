@@ -47,7 +47,8 @@ for you). All options are optional; the defaults target cloud Azure DevOps.
     pat               = nil,    -- PAT string, or a function returning one
     project           = nil,    -- default "org/project" for :Azdo items
     create_in_tab     = true,   -- open a new PR in a new tab
-    comments_width    = nil,    -- comments split width, % of editor (1-99)
+    pr                = { … },  -- PR-view settings (e.g. comments pane width %)
+    items             = { … },  -- how `open_split` splits (direction + size)
     debug             = false,  -- log REST calls to stdpath('log')/azdo.log
     workitem_sections = { … },  -- editable work-item sections, per type
     keymaps           = { … },  -- buffer-local default keys, per action
@@ -76,10 +77,66 @@ for you). All options are optional; the defaults target cloud Azure DevOps.
 
 `create_in_tab` (boolean) Open a newly-created PR in a new tab. Default true.
 
-`comments_width` (number|nil) Width of the PR comments split, as a percentage
-              (1-99) of the editor width. nil keeps Vim's 50% default. E.g.
-              `comments_width = 30` for a narrow comments pane. |azdo-diff|
+                                                          *azdo-config-pr*
+`pr`          (table) PR-view settings (the `pr` / `prdiff` / `prcomments`
+              buffers). |azdo-diff|
+              - `comments.width` (number|nil) Width of the comments pane, as a
+                percentage (1-99) of the editor width. nil keeps Vim's 50%
+                default. E.g. `pr = { comments = { width = 30 } }` for a narrow
+                comments pane.
+              The legacy flat `comments_width` key still works (mapped onto
+              `pr.comments.width`) but is deprecated.
 
+                                                       *azdo-config-items*
+`items`       (table) How the `open_split` mapping (|<Plug>(azdo-open-split)|,
+              default `<C-W><CR>`) opens the PR / work item under the cursor —
+              e.g. from the status or `:Azdo items` dashboard:
+              - `split` ('vertical'|'horizontal') Split direction. Default
+                'vertical' (side-by-side).
+              - `size`  (number|nil) Split size, as a percentage (1-99) of the
+                editor. For a vertical split this is the new window's width; for
+                horizontal, its height. nil keeps Vim's default even split.
+              - `sort`  (string) Default sort for the `:Azdo items` dashboard:
+                'changed', 'created', 'id', 'title', 'type', 'state', or
+                'assignee' (a trailing " date" is allowed, e.g. 'created date').
+                Date sorts are newest-first; 'state' is in board order. Default
+                'changed'. Re-sort interactively with the `s` keymap.
+              - `group` (boolean) Group the dashboard under `###` subheadings
+                derived from the sort (by day for dates, by state in board
+                order, by type/assignee). 'id' and 'title' are never grouped.
+                Default true; false renders a flat list. Toggle it from the `s`
+                picker.
+              - `fold`  (boolean|string[]) Fold groups closed by default
+                (grouping only). false = all open (default), true = all closed,
+                or a list of group labels (typically state names, e.g.
+                `{ 'Done' }`) to start folded while the rest stay open — handy to
+                collapse finished work without hiding it. Expand with the
+                standard fold keys: `za` toggles the group under the cursor, `zR`
+                opens all, `zM` closes all. The list applies on first render, so
+                pair it with `sort = 'state'` (or whichever grouping produces
+                those labels).
+              - `assignee` ('me'|'all'|string|string[]) Who the dashboard
+                lists. 'me' (default) = items assigned to you (`@Me`); 'all' =
+                everyone's active items; a name string = one person (matched on
+                display name or unique name); a list = several people (OR'd).
+                Change it at runtime with the `assignee` keymap (default `ga`),
+                which pops a multi-select of the project's active assignees.
+              - `hide_states` (string[]) States to hide from the active list,
+                case-insensitive, e.g. `{ 'Done' }`. Hidden items are filtered
+                out before grouping and their count shows in the header; reveal
+                them with the `toggle_hidden` keymap (default `gh`). The WIQL
+                already drops Closed/Removed. Default `{}`. |azdo-workitems| >lua
+    require('azdo').setup({
+      items = {
+        split = 'vertical',
+        size = 40,
+        sort = 'state',
+        group = true,
+        fold = true,
+        hide_states = { 'Done' },
+      },
+    })
+<
 `debug`       (boolean) Log REST calls to `stdpath('log')/azdo.log`. Default
               false.
 
@@ -222,6 +279,25 @@ Default mappings (local to `azdo://` buffers):
     In the work-items dashboard, acts on the `#id` under the cursor; in a
     work-item view, acts on that item.
     <Plug>(azdo-tag-toggle)
+  - `s` Sort the work-items dashboard. Prompts (via |vim.ui.select()|, so it
+    flows through Telescope / fzf-lua / snacks / the default picker) for a
+    field, then re-orders (and re-groups) the list in place. The picker also
+    has an entry to toggle grouping. |azdo-workitems|
+    <Plug>(azdo-sort)
+  - `cc` Set the work item's State. Prompts (via |vim.ui.select()|) with the
+    states valid for that item's type, then patches it — the dashboard's
+    keyboard equivalent of dragging a card between board columns.
+    In the dashboard, acts on the `#id` under the cursor; in a work-item view,
+    on that item. |azdo-workitems|
+    <Plug>(azdo-set-state)
+  - `gh` Show/hide the dashboard's hidden states (`items.hide_states`). Only
+    meaningful when some states are configured to hide. |azdo-workitems|
+    <Plug>(azdo-toggle-hidden)
+  - `ga` Filter the dashboard by assignee. Pops a multi-select popup (a markdown
+    float) of "All assignees", "Me", and the project's active assignees; toggle
+    entries with `<Space>`, apply with `<CR>`, cancel with `q`/`<Esc>`. Refetches
+    with the new filter; the choice sticks across refreshes. |azdo-workitems|
+    <Plug>(azdo-assignee)
 
 
 ------------------------------------------------------------------------------
@@ -422,15 +498,19 @@ WORK ITEMS                                                     *azdo-workitems*
 Dashboard ~
 
 `:Azdo items` opens a dashboard of the work items assigned to you (`items`,
-`mine`, and `workitems` are all accepted). It runs the WIQL query
-`[System.AssignedTo] = @Me`, active (not Closed/Removed), newest-changed first.
+`mine`, and `workitems` are all accepted). By default it runs the WIQL query
+`[System.AssignedTo] = @Me`, active (not Closed/Removed), newest-changed first;
+the `ga` keymap (below) re-targets it at "all" or specific people.
 |<mods>| work, e.g. `:vertical Azdo items`.
 
 The dashboard needs only a project, not a repo. It is resolved from, in order:
 the `project` option, the current `azdo://` buffer's repo, then the |current-
 directory|'s clone. Set `project` (|azdo-config|) to run `:Azdo items` anywhere.
 
-Each dashboard line shows `#id  [type/state]  title  — assignee`.
+Each dashboard line shows `#id  [type/state]  title`. When the list spans more
+than one person (e.g. the "all" filter), each line also carries the assignee as
+a styled `` `@Name` `` token; a single-assignee list (such as your own items)
+omits it, since it would just repeat.
 
 Hit <Enter> (or `CTRL-W<Enter>`) on a `#id` to open that work item. The view
 is rendered from the REST API (`pat` / `base_url` aware) as
@@ -466,6 +546,85 @@ project (so each project shows its own pins):
 >
     stdpath('data')/azdo/tags.json
 <
+Filtering by assignee ~
+
+Press `ga` in the dashboard to choose whose items it lists.
+|<Plug>(azdo-assignee)| A small markdown popup appears with "All assignees",
+"Me", and a roster of people. Toggle entries with `<Space>` (or `<Tab>`), apply
+with `<CR>`, cancel with `q`/`<Esc>`. "All assignees" is mutually exclusive with
+the individual picks. Applying refetches the dashboard, since the assignee is
+part of the WIQL query; the choice sticks across `R` refreshes.
+
+The roster comes from `items.assignees` when you set it — a fixed list of the
+people you filter by, shown instantly with no extra query (recommended): >lua
+    require('azdo').setup({
+      items = { assignees = { 'Aaron Shahriari', 'Jane Doe', 'John Roe' } },
+    })
+<
+When `items.assignees` is unset, the roster is instead derived from the project's
+most-recently-active work items (one bounded query, `$top` 200) — a little slower
+on a large project, and it only sees who's been active lately.
+
+Set the default audience (who the dashboard lists on open) with `items.assignee`
+in |azdo-config|: >lua
+    require('azdo').setup({ items = { assignee = 'me' } })  -- default
+    require('azdo').setup({ items = { assignee = 'all' } }) -- everyone
+    require('azdo').setup({ items = { assignee = 'Jane Doe' } })
+    require('azdo').setup({ items = { assignee = { 'Jane Doe', 'John Roe' } } })
+<
+'me' uses `@Me` (robust to display-name quirks); a name string or list is matched
+in WIQL against each person's display name or unique name (e.g. their email).
+
+Sorting ~
+
+Press `s` in the dashboard to re-order the list. It prompts (via
+|vim.ui.select()|, so a Telescope / fzf-lua / snacks UI is used if installed)
+for a field — changed date, created date, id, title, type, state, or assignee —
+and re-renders both sections in place. The choice sticks across `R` refreshes.
+|<Plug>(azdo-sort)|
+
+Set the default sort with `items.sort` in |azdo-config|. A trailing " date" is
+accepted, so all of these are equivalent: >lua
+    require('azdo').setup({ items = { sort = 'created' } })
+    require('azdo').setup({ items = { sort = 'created date' } })
+<
+Date sorts are newest-first; the default is 'changed' (most-recently-updated
+first), matching the order the server returns. The 'state' sort uses board
+order (New/Approved → Committed → In Progress → Resolved → Testing → Done),
+not alphabetical.
+
+Grouping ~
+
+By default the list is grouped under `###` subheadings derived from the sort:
+by day for date sorts (e.g. "June 27, 2026"), by state in board order (like the
+columns of the Azure board), and by type or assignee for those sorts. 'id' and
+'title' are never grouped. Toggle grouping from the `s` picker, or set the
+default with `items.group` in |azdo-config|.
+
+Groups are folds. Set `items.fold = true` to have them all start closed, or a
+list of group labels to start only those folded — e.g. `items.fold = { 'Done' }`
+with `sort = 'state'` collapses the Done column while the rest stay open (a way
+to tuck finished work away without hiding it like `hide_states` does). Then use
+the standard fold keys to expand: `za` toggles the group under the cursor, `zR`
+opens all, `zM` closes all. A closed group's fold line shows its item count.
+
+Hiding ~
+
+Set `items.hide_states` (e.g. `{ 'Done' }`) to drop those states from the
+active list — handy for tucking away finished work. Hidden items are filtered
+before grouping and their count shows in the header ("… · 3 hidden"); the WIQL
+already drops Closed/Removed. Press `gh` to reveal them (and again to re-hide).
+|<Plug>(azdo-toggle-hidden)|
+
+States ~
+
+Press `cc` on a work item — the `#id` under the cursor in the dashboard, or the
+item in a work-item view — to change its State. |<Plug>(azdo-set-state)| It
+prompts (via |vim.ui.select()|) with the states valid for that item's type (a
+Bug offers different states than a Product Backlog Item), then patches
+`System.State`. The dashboard updates in place; a later `R` pulls fresh. This
+is the keyboard equivalent of dragging a card between columns on the board.
+
 ==============================================================================
 HIGHLIGHTS                                                    *azdo-highlights*
 

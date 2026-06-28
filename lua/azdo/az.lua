@@ -828,7 +828,7 @@ end
 --- Batch-fetches display fields for up to 200 work-item ids. `errorPolicy=omit` so a
 --- since-deleted id drops out instead of failing the whole batch (tagged items may vanish).
 --- @param ids integer[]
---- @param cb fun(items?: {id:integer, title:string, type:string, state:string}[], err?: string)
+--- @param cb fun(items?: {id:integer, title:string, type:string, state:string, assignee:string, created:string, changed:string}[], err?: string)
 local function fetch_workitem_fields(repo, ids, cb)
   if #ids == 0 then
     return cb({})
@@ -837,7 +837,7 @@ local function fetch_workitem_fields(repo, ids, cb)
   for i = 1, math.min(#ids, 200) do
     capped[i] = ids[i]
   end
-  local extra = ('ids=%s&fields=System.Id,System.Title,System.WorkItemType,System.State,System.AssignedTo&errorPolicy=omit'):format(
+  local extra = ('ids=%s&fields=System.Id,System.Title,System.WorkItemType,System.State,System.AssignedTo,System.CreatedDate,System.ChangedDate&errorPolicy=omit'):format(
     table.concat(capped, ',')
   )
   az_rest('get', with_api(f('%s/wit/workitems', project_base(repo)), extra), nil, function(batch, berr, bcode)
@@ -854,6 +854,9 @@ local function fetch_workitem_fields(repo, ids, cb)
         type = fld['System.WorkItemType'] or 'Work Item',
         state = fld['System.State'] or '',
         assignee = (type(a) == 'table' and (a.displayName or a.uniqueName)) or a or 'Unassigned',
+        -- ISO-8601 timestamps; sort lexicographically (azdo.pr sort feature).
+        created = fld['System.CreatedDate'] or '',
+        changed = fld['System.ChangedDate'] or '',
       }
     end
     cb(items)
@@ -881,21 +884,76 @@ end
 
 --- Fetches display fields for an explicit list of work-item ids (e.g. tagged items).
 --- @param ids integer[]
---- @param cb fun(items?: {id:integer, title:string, type:string, state:string}[], err?: string)
+--- @param cb fun(items?: {id:integer, title:string, type:string, state:string, assignee:string, created:string, changed:string}[], err?: string)
 function M.get_workitems(repo, ids, cb)
   fetch_workitem_fields(repo, ids, cb)
 end
 
---- Lists work items assigned to the authenticated user (active, not Closed/Removed),
---- newest-changed first. Runs a WIQL query for ids, then a batch fetch for display fields.
---- @param cb fun(items?: {id:integer, title:string, type:string, state:string}[], err?: string)
-function M.list_my_workitems(repo, cb)
+--- Lists the valid states for a work-item type, in the type's own workflow order
+--- (which Azure returns "backlog → done"). Used by the dashboard's set-state picker.
+--- @param wtype string work-item type name, e.g. "Product Backlog Item"
+--- @param cb fun(states?: {name:string, category:string}[], err?: string)
+function M.get_workitem_states(repo, wtype, cb)
+  local url = with_api(f('%s/wit/workitemtypes/%s/states', project_base(repo), urlencode(wtype)))
+  az_rest('get', url, nil, function(resp, stderr, code)
+    if code ~= 0 or not resp then
+      return cb(nil, stderr or 'failed to load states')
+    end
+    local states = {}
+    for _, s in ipairs(resp.value or {}) do
+      states[#states + 1] = { name = s.name, category = s.stateCategory or '' }
+    end
+    cb(states)
+  end)
+end
+
+--- Builds the WIQL `[System.AssignedTo]` clause for an assignee filter:
+---   nil / 'me' → assigned to the authenticated user (`= @Me`)
+---   'all'      → no clause (everyone's items)
+---   a string   → that one person (matched on display name or unique name)
+---   a list     → any of those people (OR'd)
+--- Single quotes in names are WIQL-escaped (doubled). Returns a clause that
+--- starts with "AND " (or "" for 'all'), ready to splice after the State filters.
+--- @param assignee nil|string|string[]
+--- @return string
+local function assigned_to_clause(assignee)
+  if assignee == nil or assignee == 'me' then
+    return 'AND [System.AssignedTo] = @Me '
+  end
+  if assignee == 'all' then
+    return ''
+  end
+  local people = type(assignee) == 'table' and assignee or { assignee }
+  local ors = {}
+  for _, name in ipairs(people) do
+    if type(name) == 'string' and name ~= '' then
+      ors[#ors + 1] = ("[System.AssignedTo] = '%s'"):format(name:gsub("'", "''"))
+    end
+  end
+  if #ors == 0 then -- empty list → fall back to "mine"
+    return 'AND [System.AssignedTo] = @Me '
+  end
+  return 'AND (' .. table.concat(ors, ' OR ') .. ') '
+end
+
+--- Lists active work items (not Closed/Removed) for the given assignee filter,
+--- newest-changed first. Runs a WIQL query for ids, then a batch fetch for
+--- display fields. See `assigned_to_clause` for the accepted `assignee` shapes.
+--- @param assignee nil|string|string[] who to list (nil/'me' = the signed-in user)
+--- @param cb fun(items?: {id:integer, title:string, type:string, state:string, assignee:string, created:string, changed:string}[], err?: string)
+function M.list_workitems(repo, assignee, cb)
   local wiql = {
-    query = "SELECT [System.Id] FROM WorkItems WHERE [System.AssignedTo] = @Me "
-      .. "AND [System.State] <> 'Closed' AND [System.State] <> 'Removed' "
+    query = "SELECT [System.Id] FROM WorkItems WHERE [System.State] <> 'Closed' "
+      .. "AND [System.State] <> 'Removed' "
+      .. assigned_to_clause(assignee)
       .. 'ORDER BY [System.ChangedDate] DESC',
   }
-  az_rest('post', with_api(f('%s/wit/wiql', project_base(repo))), wiql, function(resp, stderr, code)
+  -- Bound the result server-side with `$top`. Without it, an unfiltered query
+  -- (assignee = 'all') returns *every* active item in the project — a slow,
+  -- huge response — only for us to discard all but the first 200 anyway (the
+  -- `ids=` batch fetch caps at 200). `$top` moves that cap to the server.
+  local url = with_api(f('%s/wit/wiql', project_base(repo)), '$top=200')
+  az_rest('post', url, wiql, function(resp, stderr, code)
     if code ~= 0 or not resp then
       return cb(nil, stderr or 'WIQL query failed')
     end
@@ -907,6 +965,38 @@ function M.list_my_workitems(repo, cb)
       end
     end
     fetch_workitem_fields(repo, ids, cb)
+  end)
+end
+
+--- Lists work items assigned to the authenticated user. Thin wrapper over
+--- `list_workitems` kept for callers/back-compat.
+--- @param cb fun(items?: table[], err?: string)
+function M.list_my_workitems(repo, cb)
+  return M.list_workitems(repo, 'me', cb)
+end
+
+--- The distinct assignees on the project's active work items, A→Z (for the
+--- dashboard's assignee-filter picker). Derived from the same active-items query
+--- as the dashboard, so it's capped at 200 items — a roster of who's currently
+--- working, not the full directory. "Unassigned" is dropped.
+--- @param cb fun(names?: string[], err?: string)
+function M.list_assignees(repo, cb)
+  M.list_workitems(repo, 'all', function(items, err)
+    if not items then
+      return cb(nil, err)
+    end
+    local seen, names = {}, {}
+    for _, wi in ipairs(items) do
+      local a = wi.assignee
+      if a and a ~= '' and a ~= 'Unassigned' and not seen[a] then
+        seen[a] = true
+        names[#names + 1] = a
+      end
+    end
+    table.sort(names, function(x, y)
+      return x:lower() < y:lower()
+    end)
+    cb(names)
   end)
 end
 

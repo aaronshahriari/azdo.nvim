@@ -31,6 +31,17 @@ Also accepts an Azure DevOps URL, an `org/project/repo#42` slug, or a commit SHA
 Inside any `azdo://` buffer, press `<Enter>` to run `:Azdo` on the target at cursor. Hit `g?` to
 review the keymaps.
 
+Run `:Azdo items` for the work-items dashboard (items assigned to you by default). In it: `t`
+tags/pins an item, `s` sorts and groups the list (by changed/created date, state in board order,
+type, or assignee — grouped under subheadings), `ga` filters by **assignee** (a multi-select popup
+— pick **All**, just yourself, or a few teammates), and `cc` sets a work item's **State** via a
+picker — the keyboard equivalent of dragging a card between columns on the Azure board. Groups are
+foldable (`items.fold = true` to start all collapsed, or `items.fold = { "Done" }` to start just
+those state groups folded; `za`/`zR`/`zM` to expand), and `items.hide_states = { "Done" }` tucks
+finished work away entirely — `gh` toggles it back into view. Set the default audience with
+`items.assignee` (`"me"` / `"all"` / a name / a list of names), and list the teammates you filter
+by in `items.assignees` so the `ga` picker shows them instantly (no extra query).
+
 Don't want to memorize commands? Run `:AzdoMenu` for a context-aware command palette (it routes
 through `vim.ui.select`, so your Telescope/fzf-lua/snacks picker renders it). Bind it for quick
 access, e.g. `vim.keymap.set('n', '<leader>a', '<Plug>(azdo-menu)')`.
@@ -76,7 +87,8 @@ require('azdo').setup({
   base_url       = nil,    -- on-prem collection root; nil = cloud dev.azure.com
   pat            = nil,    -- PAT string, or a function returning one; else az login
   project        = "org/project",  -- default project for `:Azdo items`
-  comments_width = 30,     -- comments split width, % of editor width
+  pr             = { comments = { width = 30 } },  -- PR diff/comments split: comments pane = 30% of editor width
+  items          = { split = "vertical", size = 40, sort = "changed", group = true, fold = false, assignee = "me", assignees = { "Jane Doe" }, hide_states = {} },  -- open_split + dashboard sort/group/fold/assignee(s)/hide
   menu           = "<leader>a",    -- key for the :AzdoMenu command palette
   -- workitem_sections, keymaps, api_version, create_in_tab, debug … see :help azdo-config
 })
