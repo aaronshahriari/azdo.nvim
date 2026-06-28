@@ -1,4 +1,4 @@
---- @alias Feat 'comment'|'commit'|'edit'|'issue'|'logs'|'merge'|'pr'|'prcomments'|'prdiff'|'review'|'status'
+--- @alias Feat 'comment'|'commit'|'edit'|'issue'|'logs'|'merge'|'pr'|'prcomments'|'prdiff'|'review'|'status'|'workitems'
 
 --- @class BufState
 --- Buffer-local b:azdo dict.

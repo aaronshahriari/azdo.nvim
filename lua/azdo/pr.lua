@@ -3,9 +3,46 @@
 local comments = require('azdo.comments')
 local az = require('azdo.az')
 local state = require('azdo.state')
+local tags = require('azdo.tags')
 local util = require('azdo.util')
+local config = require('azdo.config')
 
 local M = {}
+
+-- Branch candidates for the `:AzdoCreate` target-branch prompt, refreshed just
+-- before each prompt. Read by `_complete_branch` (the input() completion fn).
+local branch_candidates = {}
+
+--- `customlist` completion for the target-branch prompt. Prefix-matches the
+--- branches gathered in `branch_candidates`. Referenced as
+--- `v:lua.require'azdo.pr'._complete_branch`.
+--- @param arglead string
+--- @return string[]
+function M._complete_branch(arglead)
+  if arglead == '' then
+    return branch_candidates
+  end
+  return vim.tbl_filter(function(b)
+    return b:find('^' .. vim.pesc(arglead)) ~= nil
+  end, branch_candidates)
+end
+
+--- Parses `git for-each-ref …:short` output into a sorted, de-duplicated branch
+--- list (origin/ prefix stripped, HEAD dropped).
+--- @param refs string
+--- @return string[]
+local function collect_branches(refs)
+  local seen, out = {}, {}
+  for line in tostring(refs or ''):gmatch('[^\r\n]+') do
+    local name = line:gsub('^origin/', '')
+    if name ~= '' and name ~= 'HEAD' and not seen[name] then
+      seen[name] = true
+      out[#out + 1] = name
+    end
+  end
+  table.sort(out)
+  return out
+end
 
 --- Resolves the current local repo "org/project/repo", blocking up to 5s.
 --- @return string?
@@ -18,6 +55,33 @@ local function resolve_local_repo()
     return not not repo
   end)
   return repo
+end
+
+--- The project segment of an "org/project/repo" string (work-item tags are keyed by it).
+--- @param repo string?
+--- @return string?
+local function project_label(repo)
+  return repo and (repo:match('^[^/]+/([^/]+)/') or repo) or nil
+end
+
+--- Resolves an "org/project/repo"-shaped string for project-level (work-item) endpoints.
+--- Work items are project-scoped, so the repo segment is only a placeholder ("_") here —
+--- `az.project_base()` reads org+project and ignores the name.
+--- Precedence: the `project` option ("org/project", or just "project" on-prem where the
+--- collection lives in `base_url`) > current buffer's repo > local git clone.
+--- @return string? repo, string? label "<project>" for display
+local function resolve_project_repo()
+  local p = config.options.project
+  if type(p) == 'string' and p ~= '' then
+    local parts = vim.split(p, '/', { plain = true, trimempty = true })
+    if #parts >= 2 then
+      return ('%s/%s/_'):format(parts[1], parts[2]), parts[2]
+    elseif #parts == 1 then
+      return ('_/%s/_'):format(parts[1]), parts[1] -- on-prem: org folded into azdo_base_url
+    end
+  end
+  local repo = (vim.b.azdo or {}).repo or resolve_local_repo()
+  return repo, project_label(repo)
 end
 
 --- @param repo string "org/project/repo"
@@ -97,6 +161,14 @@ function M.select(opts)
   local smods = (opts or {}).smods or {}
   local window_mod = (smods.split or '') ~= '' or smods.vertical or smods.horizontal or (smods.tab or -1) >= 0
   local focus = not window_mod
+
+  -- Work-items dashboard: `:Azdo items` (aka `mine` / `workitems`).
+  if arg:match('^%s*items%s*$') or arg:match('^%s*mine%s*$') or arg:match('^%s*workitems%s*$') then
+    if window_mod then
+      vim.cmd(((opts or {}).mods or '') .. ' new')
+    end
+    return M.show_workitems(focus)
+  end
 
   local target, repo
   if #arg > 0 then
@@ -230,6 +302,9 @@ function M.refresh()
   if feat == 'status' then
     return M.show_status(true)
   end
+  if feat == 'workitems' then
+    return M.show_workitems(true)
+  end
   -- Drop cached pr_data on the `/pr/…` buf so `az.get_pr_data` re-fetches.
   local b = vim.b.azdo or {}
   if b.repo and b.id then
@@ -348,27 +423,365 @@ function M.show_status(focus, repo)
   end)
 end
 
---- Shows a work-item ("issue") via `az boards work-item show`.
+--- Renders a `  #id  [type/state]  title  — assignee` line for the dashboard.
+local function wi_line(wi)
+  local s = ('  #%d  [%s/%s]  %s'):format(wi.id, wi.type, wi.state, wi.title)
+  if wi.assignee and wi.assignee ~= '' then
+    s = s .. ('  — %s'):format(wi.assignee)
+  end
+  return s
+end
+
+--- Dashboard of work items assigned to you (active, newest-changed first), with a
+--- "Tagged" section at the top for items you've pinned with `t` (see `tag_toggle`).
+--- Mirrors `show_status`: a markdown list buffer whose `#id` lines open via `<CR>`.
+--- @param focus boolean
+--- @param repo? string "org/project/repo"
+function M.show_workitems(focus, repo)
+  local label
+  if repo then
+    label = project_label(repo)
+  else
+    repo, label = resolve_project_repo()
+  end
+  local buf = state.init_buf('workitems', focus, nil, 'all', { repo = repo })
+  util.set_default_keymaps(buf)
+  if not repo then
+    util.buf_set_readonly_lines(buf, {
+      'azdo: no project to query.',
+      'Set `project = "org/project"` in setup() (or just "project" on-prem),',
+      'or run :Azdo items from inside an Azure DevOps clone.',
+    }, 'markdown')
+    return
+  end
+  local key = label or repo
+  local done = util.progress('Loading work items...')
+
+  local function render(tagged_items, items)
+    local lines = { ('# My work items — %s'):format(key), '' }
+    if #tagged_items > 0 then
+      lines[#lines + 1] = ('## ★ Tagged (%d)'):format(#tagged_items)
+      for _, wi in ipairs(tagged_items) do
+        lines[#lines + 1] = wi_line(wi)
+      end
+      lines[#lines + 1] = ''
+    end
+    lines[#lines + 1] = ('## Assigned to you (active): %d'):format(#items)
+    for _, wi in ipairs(items) do
+      lines[#lines + 1] = wi_line(wi)
+    end
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = '<CR> open · t tag/untag · g? help'
+    util.buf_set_readonly_lines(buf, lines, 'markdown')
+  end
+
+  -- Fetch the (possibly closed / others') tagged items by id, then the active list.
+  local function then_active(tagged_items)
+    az.list_my_workitems(repo, function(items, err)
+      if not items then
+        done('failed')
+        util.buf_set_readonly_lines(buf, { ('azdo: failed to list work items: %s'):format(err or '') }, 'markdown')
+        return
+      end
+      render(tagged_items, items)
+      done('success')
+    end)
+  end
+
+  local tagged_ids = tags.list(key)
+  if #tagged_ids == 0 then
+    then_active({})
+  else
+    az.get_workitems(repo, tagged_ids, function(t_items)
+      local by_id = {}
+      for _, wi in ipairs(t_items or {}) do
+        by_id[wi.id] = wi
+      end
+      local ordered = {} -- preserve tag order; drop any that no longer resolve
+      for _, id in ipairs(tagged_ids) do
+        if by_id[id] then
+          ordered[#ordered + 1] = by_id[id]
+        end
+      end
+      then_active(ordered)
+    end)
+  end
+end
+
+--- Tags/untags a work item (local pin). In the dashboard, acts on the `#id` under the
+--- cursor; in a work-item view, acts on that item. Persisted per-project via `azdo.tags`.
+function M.tag_toggle()
+  local b = vim.b.azdo or {}
+  local repo = b.repo
+  if not repo then
+    return util.msg('azdo: no project context here', vim.log.levels.WARN)
+  end
+  local key = project_label(repo) or repo
+  local id
+  if b.feat == 'workitems' then
+    id = tonumber(vim.api.nvim_get_current_line():match('#(%d+)'))
+    if not id then
+      return util.msg('azdo: put the cursor on a #id line to tag it')
+    end
+  else
+    id = tonumber(b.id)
+  end
+  if not id then
+    return util.msg('azdo: no work item to tag here', vim.log.levels.WARN)
+  end
+  local now = tags.toggle(key, id)
+  util.msg(('azdo: #%d %s'):format(id, now and 'tagged ★' or 'untagged'))
+  if b.feat == 'workitems' then
+    M.show_workitems(true) -- refresh so the Tagged section updates
+  end
+end
+
+--- Converts a work-item rich-text field (HTML) to markdown lines for display.
+--- Best-effort: headings, bold/italic, inline code, links, and lists become their
+--- markdown equivalents; everything else is stripped. Order matters — block-level
+--- newlines first, then inline marks, then drop leftover tags, then decode entities.
+--- @param html string?
+--- @return string[]
+local function html_to_markdown(html)
+  if type(html) ~= 'string' or html == '' then
+    return {}
+  end
+  local s = html:gsub('\r\n?', '\n')
+  -- Block boundaries -> newlines.
+  s = s:gsub('<%s*[bB][rR]%s*/?%s*>', '\n')
+  s = s:gsub('<%s*[hH][rR]%s*/?%s*>', '\n\n---\n\n')
+  for n = 1, 6 do
+    s = s:gsub(('<%%s*[hH]%d[^>]*>'):format(n), ('\n\n%s '):format(('#'):rep(n + 2))) -- nest under our "## <section>"
+    s = s:gsub(('</%%s*[hH]%d%%s*>'):format(n), '\n\n')
+  end
+  s = s:gsub('<%s*[lL][iI][^>]*>', '\n- ') -- list item -> markdown bullet (tight list)
+  s = s:gsub('</?%s*[pP][^>]*>', '\n\n') -- paragraph boundary
+  s = s:gsub('</?%s*[dD][iI][vV][^>]*>', '\n')
+  -- Inline marks -> markdown.
+  s = s:gsub('<[aA][^>]-href="([^"]+)"[^>]*>(.-)</[aA]>', '[%2](%1)')
+  s = s:gsub('</?%s*[sS][tT][rR][oO][nN][gG]%s*>', '**')
+  s = s:gsub('</?%s*[bB]%s*>', '**')
+  s = s:gsub('</?%s*[eE][mM]%s*>', '*')
+  s = s:gsub('</?%s*[iI]%s*>', '*')
+  s = s:gsub('</?%s*[cC][oO][dD][eE]%s*>', '`')
+  s = s:gsub('<[^>]*>', '') -- drop remaining tags
+  -- Decode entities (&amp; last, so "&amp;lt;" stays literal "&lt;").
+  s = s:gsub('&nbsp;', ' '):gsub('&#160;', ' ')
+  s = s:gsub('&lt;', '<'):gsub('&gt;', '>'):gsub('&quot;', '"'):gsub('&#39;', "'"):gsub('&amp;', '&')
+  local out = {}
+  for _, l in ipairs(vim.split(s, '\n', { plain = true })) do
+    l = l:gsub('%s+$', '')
+    -- Collapse runs of blank lines into one.
+    if not (l == '' and (#out == 0 or out[#out] == '')) then
+      out[#out + 1] = l
+    end
+  end
+  while #out > 0 and out[#out] == '' do
+    table.remove(out, #out)
+  end
+  return out
+end
+
+--- The editable sections for a work-item type (falls back to "default"). The
+--- section catalog lives in |azdo-config| under `workitem_sections`; each entry
+--- is `{ title, field }` where `field` is the Azure reference name.
+--- @param wtype string
+--- @return {[1]:string, [2]:string}[]
+local function sections_for(wtype)
+  local cfg = config.options.workitem_sections or {}
+  return cfg[wtype] or cfg.default or {}
+end
+
+--- Converts markdown (the editable section body) back to the lenient HTML Azure stores.
+--- Inverse of `html_to_markdown`, best-effort: paragraphs -> <div>, `- ` -> <ul><li>,
+--- and inline **bold** / *italic* / `code` / [text](url). Plain enough that Azure's
+--- editor re-opens it cleanly.
+--- @param md string
+--- @return string
+local function markdown_to_html(md)
+  local function inline(s)
+    s = s:gsub('&', '&amp;'):gsub('<', '&lt;'):gsub('>', '&gt;')
+    s = s:gsub('%[([^%]]*)%]%(([^%)]*)%)', '<a href="%2">%1</a>')
+    s = s:gsub('%*%*([^*]+)%*%*', '<b>%1</b>')
+    s = s:gsub('%*([^*]+)%*', '<i>%1</i>')
+    s = s:gsub('`([^`]+)`', '<code>%1</code>')
+    return s
+  end
+  local html = {}
+  local in_list = false
+  local function close_list()
+    if in_list then
+      html[#html + 1] = '</ul>'
+      in_list = false
+    end
+  end
+  for _, line in ipairs(vim.split(md or '', '\n', { plain = true })) do
+    local item = line:match('^%s*[-*]%s+(.*)$')
+    if item then
+      if not in_list then
+        html[#html + 1] = '<ul>'
+        in_list = true
+      end
+      html[#html + 1] = ('<li>%s</li>'):format(inline(item))
+    elseif vim.trim(line) == '' then
+      close_list()
+      html[#html + 1] = '<div><br></div>'
+    else
+      close_list()
+      html[#html + 1] = ('<div>%s</div>'):format(inline(line))
+    end
+  end
+  close_list()
+  return table.concat(html)
+end
+
+--- Shows a work-item ("issue") via the REST API (`get_workitem`), rendered as markdown.
+--- Uses the same auth/base-url path as the rest of the plugin (PAT or `az login`,
+--- on-prem `azdo_base_url`) — no dependency on the `az boards` CLI.
 --- @param id integer
 --- @param repo string "org/project/repo"
 --- @param focus boolean
 function M.show_issue(id, repo, focus)
-  local org = split_repo(repo)
   local buf = state.init_buf('issue', focus, repo, id)
-  local cmd = {
-    'az',
-    'boards',
-    'work-item',
-    'show',
-    '--id',
-    tostring(id),
-    '--output',
-    'yaml',
-    '--organization',
-    ('https://dev.azure.com/%s'):format(org),
-  }
-  util.run_term_cmd(buf, cmd, function()
-    util.set_default_keymaps(buf)
+  util.set_default_keymaps(buf)
+  util.map_default(buf, 'n', 't', '<Plug>(azdo-tag-toggle)', 'Tag/untag this work item')
+  local done = util.progress(('Loading work item #%d...'):format(id))
+  az.get_workitem(repo, id, function(wi, err)
+    if not wi or not wi.fields then
+      done('failed')
+      util.buf_set_readonly_lines(buf, { ('azdo: failed to load work item #%d: %s'):format(id, err or '') }, 'markdown')
+      return
+    end
+    local fld = wi.fields
+    local function person(p)
+      return (type(p) == 'table' and (p.displayName or p.uniqueName)) or p or 'unassigned'
+    end
+    local tagged = tags.is_tagged(project_label(repo) or repo, id)
+    local L = {}
+    L[#L + 1] = ('# %s#%d — %s'):format(tagged and '★ ' or '', id, fld['System.Title'] or '')
+    L[#L + 1] = ''
+    L[#L + 1] = ('- **Type:** %s'):format(fld['System.WorkItemType'] or 'Work Item')
+    L[#L + 1] = ('- **State:** %s'):format(fld['System.State'] or '?')
+    L[#L + 1] = ('- **Assigned:** %s'):format(person(fld['System.AssignedTo']))
+    if fld['Microsoft.VSTS.Common.Priority'] then
+      L[#L + 1] = ('- **Priority:** %s'):format(fld['Microsoft.VSTS.Common.Priority'])
+    end
+    if fld['System.IterationPath'] then
+      L[#L + 1] = ('- **Iteration:** %s'):format(fld['System.IterationPath'])
+    end
+    if type(fld['System.Tags']) == 'string' and fld['System.Tags'] ~= '' then
+      L[#L + 1] = ('- **Tags:** %s'):format(fld['System.Tags'])
+    end
+    L[#L + 1] = ('- **Created:** %s · **Changed:** %s'):format(
+      (fld['System.CreatedDate'] or ''):sub(1, 10),
+      (fld['System.ChangedDate'] or ''):sub(1, 10)
+    )
+    L[#L + 1] = ''
+    -- Record each section's header line so `c:` can edit the section at the cursor.
+    -- The title (line 1) is a pseudo-section so `c:` in the header area edits it.
+    local secmeta = { { line = 1, title = 'Title', field = 'System.Title', is_title = true } }
+    for _, sec in ipairs(sections_for(fld['System.WorkItemType'] or '')) do
+      L[#L + 1] = '## ' .. sec[1]
+      secmeta[#secmeta + 1] = { line = #L, title = sec[1], field = sec[2] }
+      L[#L + 1] = ''
+      local body = html_to_markdown(fld[sec[2]])
+      if #body > 0 then
+        vim.list_extend(L, body)
+      else
+        L[#L + 1] = '_(empty)_'
+      end
+      L[#L + 1] = ''
+    end
+    L[#L + 1] = '---'
+    L[#L + 1] = '_c: edit section · t tag/untag · gw open in browser · g? help_'
+    util.buf_set_readonly_lines(buf, L, 'markdown')
+    state.set_b_azdo(buf, { wi_sections = secmeta })
+    done('success')
+  end)
+end
+
+--- Edits the work-item section at the cursor, in its own editable buffer. The
+--- read-only view records section line ranges in `b:azdo.wi_sections`; this picks
+--- the section whose `## ` header is at/above the cursor (or the title). Bound to
+--- `c:` (|<Plug>(azdo-edit)|) from a work-item view.
+--- @param id integer
+--- @param repo string "org/project/repo"
+function M.edit_workitem(id, repo)
+  local secs = (vim.b.azdo or {}).wi_sections
+  local chosen
+  if secs then
+    local cur = vim.fn.line('.')
+    for _, s in ipairs(secs) do
+      if s.line <= cur then
+        chosen = s
+      else
+        break
+      end
+    end
+  end
+  if not chosen then
+    return util.msg('azdo: put the cursor in a section (## …) then c: to edit it', vim.log.levels.WARN)
+  end
+  M.edit_workitem_field(id, repo, chosen.field, chosen.title, chosen.is_title)
+end
+
+--- Opens an editable (multi-line) buffer for a single work-item field, prefilled with
+--- its current value as markdown. `ZZ` saves (markdown -> HTML, plain text for the
+--- title), `ZQ` aborts — same flow as comment/PR compose. |azdo-confirm|
+--- @param id integer
+--- @param repo string "org/project/repo"
+--- @param field string Azure field reference name
+--- @param title string Human-facing section name
+--- @param is_title? boolean Title field (plain text, single line)
+function M.edit_workitem_field(id, repo, field, title, is_title)
+  local done = util.progress(('Loading %s...'):format(title))
+  az.get_workitem(repo, id, function(wi, err)
+    if not wi or not wi.fields then
+      done('failed')
+      return util.msg(('azdo: failed to load work item #%d: %s'):format(id, err or ''), vim.log.levels.ERROR)
+    end
+    done('success')
+    local fld = wi.fields
+    local wtype = fld['System.WorkItemType'] or ''
+    local content, baseline
+    if is_title then
+      baseline = fld['System.Title'] or ''
+      content = { baseline }
+    else
+      content = html_to_markdown(fld[field])
+      if #content == 0 then
+        content = { '' }
+      end
+      baseline = vim.trim(table.concat(content, '\n'))
+    end
+
+    local heading = { { ('Edit %s — #%d (%s) | ZZ save, ZQ abort'):format(title, id, wtype), 'Comment' } }
+    vim.schedule(function()
+      comments.edit_comment('edit', id, content, heading, function(input)
+        local value
+        if is_title then
+          value = vim.trim((input:gsub('\n.*$', ''))) -- title is single-line, plain text
+        else
+          value = vim.trim(input)
+        end
+        if value == vim.trim(baseline) then
+          return util.msg('azdo: no changes to save')
+        end
+        local payload = is_title and value or markdown_to_html(value)
+        local progress = util.new_progress_report(('Updating %s...'):format(title), 0)
+        progress('running')
+        az.update_workitem(repo, id, { [field] = payload }, function(ok, stderr)
+          if ok then
+            progress('success', nil, ('#%d %s updated.'):format(id, title))
+            if state.get_buf('issue', repo, id, false) then
+              M.show_issue(id, repo, false) -- refresh the read-only view if open
+            end
+          else
+            progress('failed', nil, ('Failed: %s'):format(vim.trim(stderr or '')))
+          end
+        end)
+      end)
+    end)
   end)
 end
 
@@ -514,6 +927,46 @@ function M.show_pr_diff(opts)
   end)
 end
 
+--- Toggles the PR diff + comments split. If the prdiff/prcomments windows are open, closes the
+--- comments split and restores the PR overview into the diff window(s); otherwise opens the diff
+--- (via `show_pr_diff`). Bound to `dd` in azdo:// buffers.
+function M.toggle_pr_diff(opts)
+  local ok, _, id, repo = pcall(resolve_pr, opts)
+  if not ok or not (id and repo) then
+    vim.notify('azdo: not in a PR buffer', vim.log.levels.WARN)
+    return
+  end
+
+  local prdiff = state.get_buf('prdiff', repo, id, false)
+  local prcomments = state.get_buf('prcomments', repo, id, false)
+  local diff_wins = prdiff and vim.fn.win_findbuf(prdiff) or {}
+  local cmt_wins = prcomments and vim.fn.win_findbuf(prcomments) or {}
+
+  if #diff_wins == 0 and #cmt_wins == 0 then
+    return M.show_pr_diff(opts) -- nothing open → toggle on
+  end
+
+  -- Toggle off: drop the comments split, return the diff window(s) to the PR overview.
+  for _, w in ipairs(cmt_wins) do
+    pcall(vim.api.nvim_win_close, w, false)
+  end
+  local pr_buf = state.get_buf('pr', repo, id, false)
+  for _, w in ipairs(diff_wins) do
+    if vim.api.nvim_win_is_valid(w) then
+      if pr_buf then
+        -- show_pr_comments set scrollbind/cursorbind on the diff window; clear them so the
+        -- overview scrolls normally.
+        vim.api.nvim_win_call(w, function()
+          vim.cmd('setlocal noscrollbind nocursorbind')
+        end)
+        vim.api.nvim_win_set_buf(w, pr_buf)
+      else
+        pcall(vim.api.nvim_win_close, w, false)
+      end
+    end
+  end
+end
+
 --- Posts a top-level comment on the current PR or work-item.
 local function comment_overview()
   local feat, id, repo = resolve_pr()
@@ -553,14 +1006,11 @@ M.comment = function(args)
   comments.new_comment(args.line1, args.line2)
 end
 
---- Edits PR properties (title/description) in an editable buffer, or opens a work-item in the browser.
+--- Edits PR properties (title/description), or a work item's sections, in an editable buffer.
 function M.edit_pr()
   local feat, id, repo = resolve_pr()
   if feat == 'issue' then
-    local org, project = split_repo(repo)
-    local url = ('https://dev.azure.com/%s/%s/_workitems/edit/%s'):format(org, project, id)
-    util.msg('Opening work item in browser…')
-    return vim.ui.open(url)
+    return M.edit_workitem(id, repo)
   end
   az.get_pr_data(id, repo, nil, function(pr)
     if not pr then
@@ -579,6 +1029,168 @@ function M.edit_pr()
             progress('failed', nil, ('Failed: %s'):format(vim.trim(stderr or '')))
           end
         end)
+      end)
+    end)
+  end)
+end
+
+--- Opens a scratch editor (vim-fugitive style: ZZ submits, ZQ aborts), prefilled
+--- with `content`. Mirrors `comments.edit_comment` but standalone, since PR
+--- creation happens from a normal code buffer, not an azdo:// buffer.
+--- @param content string[] initial lines
+--- @param heading table winbar chunks (see util.show_winbar)
+--- @param on_confirm fun(input: string)
+local function compose(content, heading, on_confirm)
+  vim.cmd('botright new')
+  local buf = vim.api.nvim_get_current_buf()
+  -- An acwrite buffer MUST have a name, or `:write` (which ZZ triggers) is a
+  -- silent no-op: BufWriteCmd never fires and ZZ can't submit. (edit_comment
+  -- gets its name from state.init_buf; here we name it ourselves.)
+  vim.api.nvim_buf_set_name(buf, ('azdo://create-pr/%d'):format(buf))
+  vim._with({ buf = buf }, function()
+    vim.cmd('set wrap breakindent nonumber norelativenumber nolist')
+  end)
+  util.show_winbar(0, heading)
+  vim.bo[buf].buftype = 'acwrite'
+  vim.bo[buf].bufhidden = 'wipe' -- Ensure BufWipeout fires on :q.
+  vim.bo[buf].filetype = 'markdown'
+  vim.bo[buf].textwidth = 0
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
+  -- Stay 'modified' so plain :q is refused: user must pick ZZ (submit) or ZQ (abort).
+  vim.bo[buf].modified = true
+  vim.cmd('normal! gg')
+  local win = vim.api.nvim_get_current_win()
+  vim.api.nvim_create_autocmd('BufWriteCmd', {
+    buffer = buf,
+    once = true,
+    callback = function()
+      local input = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n')
+      vim.bo[buf].modified = false -- let ZZ's close step proceed
+      vim.schedule(function()
+        -- Close the compose window ourselves so the split doesn't linger when the
+        -- user submits with `:w` (which writes but, unlike ZZ, doesn't close it).
+        -- With ZZ the window is already gone, so this is a guarded no-op.
+        if vim.api.nvim_win_is_valid(win) and #vim.api.nvim_tabpage_list_wins(0) > 1 then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+        if vim.trim(input) ~= '' then
+          on_confirm(input)
+        else
+          util.msg('aborted (empty buffer)')
+        end
+      end)
+    end,
+  })
+end
+
+--- Creates a PR from the current branch. Source = current branch; target =
+--- origin's default branch (falls back to "main"). Opens `compose` prefilled
+--- from the branch-tip commit message; first line = title, rest = description.
+function M.create_pr()
+  local repo = resolve_local_repo()
+  if not repo then
+    return util.msg('azdo: Failed to resolve repo', vim.log.levels.ERROR)
+  end
+  util.system({ 'git', 'rev-parse', '--abbrev-ref', 'HEAD' }, function(branch, _, code)
+    local cur_branch = code == 0 and vim.trim(branch) or ''
+    util.system({ 'git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD' }, function(head, _, hc)
+      local default_target = (hc == 0 and vim.trim(head):gsub('^origin/', '')) or 'main'
+      -- Gather local + origin/* branch names for the branch prompts' Tab-completion.
+      util.system({ 'git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes/origin' }, function(refs)
+        branch_candidates = collect_branches(refs)
+        vim.schedule(function()
+          local complete = "customlist,v:lua.require'azdo.pr'._complete_branch"
+          -- Both branches are editable; source defaults to the current branch.
+          local source = vim.trim(vim.fn.input({ prompt = 'Source branch: ', default = cur_branch, completion = complete }))
+          if source == '' then
+            return util.msg('azdo: PR creation aborted (no source branch)')
+          end
+          local target = vim.trim(vim.fn.input({ prompt = 'Target branch: ', default = default_target, completion = complete }))
+          if target == '' then
+            return util.msg('azdo: PR creation aborted (no target branch)')
+          end
+          if source == target then
+            return util.msg('azdo: source and target branch are the same', vim.log.levels.WARN)
+          end
+          -- Prefill ONLY the title (source branch's tip commit subject); leave the
+          -- description blank so nothing is auto-dumped into it.
+          local subject = vim.trim((vim.fn.systemlist({ 'git', 'log', '-1', '--format=%s', source })[1]) or '')
+          local content = { subject ~= '' and subject or source }
+          local heading = {
+            { ('Create PR: %s → %s'):format(source, target), 'AzdoHeading' },
+            { '  first line = title; rest = description | ZZ to create (ZQ to abort)', 'Comment' },
+          }
+          compose(content, heading, function(input)
+            local title, description = input:match('^([^\n]*)\n?(.*)$')
+            local progress = util.new_progress_report('Creating PR...', vim.api.nvim_get_current_buf())
+            az.create_pr(repo, source, target, vim.trim(title or ''), vim.trim(description or ''), function(id, stderr)
+              if id then
+                progress('success', nil, ('Created PR #%d.'):format(id))
+                -- Open the new PR's diff view. By default in a new tab so it
+                -- doesn't clobber the window you created it from; set
+                -- `create_in_tab = false` in setup() to open it in place.
+                if config.options.create_in_tab ~= false then
+                  vim.cmd('tabnew')
+                end
+                M.show_pr(id, repo, true)
+              else
+                progress('failed', nil, ('Failed: %s'):format(vim.trim(stderr or '')))
+              end
+            end)
+          end)
+        end)
+      end)
+    end)
+  end)
+end
+
+--- Opens the current PR (or work item) in the web browser.
+function M.open_web()
+  local feat, id, repo = resolve_pr()
+  local url
+  if feat == 'issue' then
+    url = az.wi_web_url(repo, id)
+  else
+    url = az.pr_web_url(repo, id)
+  end
+  util.msg('Opening in browser…')
+  vim.ui.open(url)
+end
+
+--- Links a work item assigned to you to the current PR. Lists your assigned work
+--- items, then links the chosen one (vim.ui.select).
+function M.link_workitem()
+  local feat, id, repo = resolve_pr()
+  if feat == 'issue' then
+    return util.msg('azdo: link works on a PR, not a work item', vim.log.levels.WARN)
+  end
+  local progress = util.new_progress_report('Loading work items...', 0)
+  progress('running')
+  az.list_my_workitems(repo, function(items, err)
+    if not items then
+      return progress('failed', nil, ('Failed: %s'):format(vim.trim(err or '')))
+    end
+    if #items == 0 then
+      return progress('success', nil, 'No work items assigned to you.')
+    end
+    progress('success')
+    vim.ui.select(items, {
+      prompt = ('Link work item to PR #%d:'):format(id),
+      format_item = function(wi)
+        return ('#%d  [%s]  %s'):format(wi.id, wi.type, wi.title)
+      end,
+    }, function(choice)
+      if not choice then
+        return util.msg('azdo: no work item selected')
+      end
+      local p2 = util.new_progress_report('Linking work item...', vim.api.nvim_get_current_buf())
+      az.link_workitem(repo, id, choice.id, function(ok, lerr)
+        if ok then
+          p2('success', nil, ('Linked #%d to PR #%d.'):format(choice.id, id))
+          M.refresh()
+        else
+          p2('failed', nil, ('Failed: %s'):format(vim.trim(lerr or '')))
+        end
       end)
     end)
   end)

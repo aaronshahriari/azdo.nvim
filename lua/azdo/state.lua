@@ -26,6 +26,8 @@ local bufs = {
   review = {},
   ---@type table<string, integer>
   status = {},
+  ---@type table<string, integer>
+  workitems = {},
 }
 
 --- Canonical `bufs[feat][?]` lookup key for a (repo, id) pair.

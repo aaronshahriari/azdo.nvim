@@ -5,11 +5,20 @@
 --- the provider-agnostic `PullRequest`/`Comment` shapes that the rest of the plugin consumes. Keeping
 --- the mapping here means `comments.lua`/`state.lua`/`util.lua` never learn that the backend is Azure.
 ---
---- Auth: relies on `az login`. Every `az rest` call passes `--resource <Azure DevOps GUID>` so the token
---- audience targets dev.azure.com.
+--- Cloud vs on-prem: by default urls target cloud `https://dev.azure.com/<org>`. For an on-prem Azure
+--- DevOps Server, set `base_url` in setup() to the collection root (e.g.
+--- "https://tfs.example.com/tfs/MyCollection") and, if the server is older, `api_version`
+--- (e.g. '6.0'). See `base_url`/`api_version`. On-prem almost always pairs with PAT auth (below).
+---
+--- Auth: two modes. By default it relies on `az login` (every `az rest` call passes
+--- `--resource <Azure DevOps GUID>` so the token audience targets dev.azure.com). If a PAT is configured
+--- (the `pat` option, or the `AZDO_PAT` / `AZURE_DEVOPS_EXT_PAT` env vars) it instead talks to the REST
+--- API directly via `curl` with HTTP Basic auth (`:<pat>`) — no Azure CLI / `az login` required. The PAT
+--- is handed to curl on stdin (never argv) so it can't leak via `ps`. See `get_pat`/`build_request`.
 
 local state = require('azdo.state')
 local util = require('azdo.util')
+local config = require('azdo.config')
 
 require('azdo.types')
 
@@ -21,6 +30,29 @@ local M = {}
 local AZDO_RESOURCE = '499b84ac-1321-427f-aa17-267ca6975798'
 --- REST api-version used throughout. 7.1 is GA on Azure DevOps Services.
 local API = '7.1'
+
+--- Collection base url for an on-prem Azure DevOps Server, e.g.
+--- "https://tfs.example.com/tfs/MyCollection" (no trailing slash). When set, all REST + web urls are
+--- built from it instead of cloud "https://dev.azure.com/<org>", and identity comes from
+--- `_apis/connectionData` (the cloud vssps profile api doesn't exist on-prem). Leave unset for cloud.
+--- @return string?
+local function base_url()
+  local b = config.options.base_url
+  if type(b) == 'string' and b ~= '' then
+    return (b:gsub('/+$', ''))
+  end
+  return nil
+end
+
+--- REST api-version. Defaults to 7.1 (GA on Azure DevOps Services); older on-prem servers may need an
+--- older value — set `api_version` in setup() (e.g. '6.0').
+local function api_version()
+  local v = config.options.api_version
+  if type(v) == 'string' and v ~= '' then
+    return v
+  end
+  return API
+end
 --- Azure comment ids are per-thread (1..n), not globally unique. We synthesize a globally-unique
 --- id as `thread_id * MULT + comment_id` so the agnostic thread-grouping in comments.lua works, and
 --- decode it back to (thread_id, comment_id) for the per-thread REST routes.
@@ -56,61 +88,140 @@ local function parse_repo(repo)
   return tostring(repo):match('^([^/]+)/([^/]+)/(.+)$')
 end
 
---- Base REST url for a repo's git resource: `.../_apis/git/repositories/<repo>`.
+--- Collection base: the on-prem url if configured, else cloud `https://dev.azure.com/<org>`.
+local function collection_base(org)
+  return base_url() or f('https://dev.azure.com/%s', urlencode(org))
+end
+
+--- Base REST url for a repo's git resource: `.../<project>/_apis/git/repositories/<repo>`.
 local function repo_base(repo)
   local org, project, name = parse_repo(repo)
   if not org then
     return nil
   end
-  return f(
-    'https://dev.azure.com/%s/%s/_apis/git/repositories/%s',
-    urlencode(org),
-    urlencode(project),
-    urlencode(name)
-  )
+  return f('%s/%s/_apis/git/repositories/%s', collection_base(org), urlencode(project), urlencode(name))
 end
 
---- Project-level REST base: `.../<org>/<project>/_apis`.
+--- Project-level REST base: `.../<project>/_apis`.
 local function project_base(repo)
   local org, project = parse_repo(repo)
   if not org then
     return nil
   end
-  return f('https://dev.azure.com/%s/%s/_apis', urlencode(org), urlencode(project))
+  return f('%s/%s/_apis', collection_base(org), urlencode(project))
 end
 
 --- Human-facing web url for a PR.
 local function pr_web_url(repo, prnum)
   local org, project, name = parse_repo(repo)
-  return f('https://dev.azure.com/%s/%s/_git/%s/pullrequest/%s', org, project, name, prnum)
+  return f('%s/%s/_git/%s/pullrequest/%s', collection_base(org), urlencode(project), urlencode(name), prnum)
 end
 
 --- Appends `api-version` (and any extra query) to a url.
 local function with_api(url, extra)
   local sep = url:find('?', 1, true) and '&' or '?'
-  return url .. sep .. 'api-version=' .. API .. (extra and ('&' .. extra) or '')
+  return url .. sep .. 'api-version=' .. api_version() .. (extra and ('&' .. extra) or '')
 end
 
---- Async `az rest`. Calls `cb(decoded|nil, stderr, code)`.
+--- Optional Personal Access Token. When set, azdo.nvim authenticates with the PAT (HTTP Basic)
+--- instead of `az login`. Source order: the `pat` option, then `$AZDO_PAT`, then `$AZURE_DEVOPS_EXT_PAT`
+--- (the var the `az devops` CLI itself reads). The PAT needs the "Code (read & write)" scope, plus
+--- "Build (read)" if you use the CI-logs view.
+--- @return string?
+local function get_pat()
+  local p = config.pat()
+  if p then
+    return p
+  end
+  for _, name in ipairs({ 'AZDO_PAT', 'AZURE_DEVOPS_EXT_PAT' }) do
+    local e = vim.env[name]
+    if type(e) == 'string' and e ~= '' then
+      return e
+    end
+  end
+  return nil
+end
+
+--- Builds the (argv, stdin) for one REST request. With a PAT we use curl + HTTP Basic (`:<pat>`),
+--- feeding the auth header via stdin (`--config -`) so the token never lands in argv (and thus not in
+--- `ps`). Without a PAT we use `az rest --resource` (token from `az login`). `-w '\n%{http_code}'`
+--- appends the HTTP status so `parse_response` can map non-2xx to failure (curl's own exit code is 0
+--- even for 4xx/5xx, and we want the error body, so we don't use `--fail`).
+--- @param raw boolean? request a non-JSON body (e.g. build logs); sets `Accept: */*`
+--- @param content_type string? body Content-Type (default "application/json"; work-item
+---   relation patches need "application/json-patch+json").
+--- @return string[] cmd, string? stdin
+local function build_request(method, url, body, pat, raw, content_type)
+  content_type = content_type or 'application/json'
+  if pat then
+    local cmd = {
+      'curl',
+      '-sS',
+      '--config',
+      '-',
+      '-X',
+      method:upper(),
+      '-H',
+      raw and 'Accept: */*' or 'Accept: application/json',
+      '-w',
+      '\n%{http_code}',
+    }
+    if body ~= nil then
+      vim.list_extend(cmd, { '-H', 'Content-Type: ' .. content_type, '--data-binary', vim.json.encode(body) })
+    end
+    cmd[#cmd + 1] = url
+    return cmd, f('header = "Authorization: Basic %s"\n', vim.base64.encode(':' .. pat))
+  end
+  local cmd = { 'az', 'rest', '--method', method:lower(), '--url', url, '--resource', AZDO_RESOURCE }
+  if body ~= nil then
+    vim.list_extend(cmd, { '--headers', 'Content-Type=' .. content_type, '--body', vim.json.encode(body) })
+  end
+  return cmd, nil
+end
+
+--- Normalizes a `vim.system` result into `(value, stderr, code)` where `code == 0` means success.
+--- For the PAT/curl path, strips the trailing `%{http_code}` line and maps non-2xx to failure; for the
+--- `az` path, the process exit code is authoritative. `raw` returns the response text instead of JSON.
+--- @return any value, string stderr, integer code
+local function parse_response(r, pat, raw)
+  if pat then
+    if r.code ~= 0 then
+      return nil, vim.trim(r.stderr or 'curl request failed'), r.code
+    end
+    local out, http = (r.stdout or ''):match('^(.*)\n(%d+)%s*$')
+    out = out or (r.stdout or '')
+    http = tonumber(http) or 0
+    if http < 200 or http >= 300 then
+      local msg = vim.trim(out ~= '' and out or (r.stderr or ''))
+      return nil, msg ~= '' and msg or ('HTTP ' .. http), http ~= 0 and http or 1
+    end
+    return (raw and out or parse_or_default(out, {})), '', 0
+  end
+  if r.code ~= 0 then
+    return nil, r.stderr or '', r.code
+  end
+  return (raw and (r.stdout or '') or parse_or_default(r.stdout or '', {})), r.stderr or '', 0
+end
+
+--- Async REST call. Uses a PAT (curl + HTTP Basic) when one is configured, else `az rest`.
+--- Calls `cb(decoded|nil, stderr, code)` — code 0 means success (HTTP 2xx, or `az` exit 0).
 ---
 --- @param method 'get'|'post'|'patch'|'put'|'delete'
 --- @param url string Full request url (including api-version).
 --- @param body? table JSON body for write methods.
 --- @param cb fun(resp: table?, stderr: string, code: integer)
-local function az_rest(method, url, body, cb)
-  local cmd = { 'az', 'rest', '--method', method:lower(), '--url', url, '--resource', AZDO_RESOURCE }
-  if body ~= nil then
-    vim.list_extend(cmd, { '--headers', 'Content-Type=application/json' })
-    vim.list_extend(cmd, { '--body', vim.json.encode(body) })
-  end
-  util.log('az_rest ' .. method, url)
-  util.system(cmd, function(stdout, stderr, code)
+--- @param content_type string? body Content-Type (default "application/json").
+local function az_rest(method, url, body, cb, content_type)
+  local pat = get_pat()
+  local cmd, stdin = build_request(method, url, body, pat, false, content_type)
+  util.log('rest ' .. method, url)
+  vim.system(cmd, { text = true, stdin = stdin }, vim.schedule_wrap(function(r)
+    local resp, stderr, code = parse_response(r, pat, false)
     if code ~= 0 then
-      util.log('az_rest error', { url = url, stderr = stderr })
-      return cb(nil, stderr or '', code)
+      util.log('rest error', { url = url, stderr = stderr, code = code })
     end
-    cb(parse_or_default(stdout, {}), stderr or '', code)
-  end)
+    cb(resp, stderr, code)
+  end))
 end
 
 --- Write helper shaped like the rest of the plugin expects: `cb(resp)` where `resp.errors == nil`
@@ -159,6 +270,23 @@ end
 --- @return string? repo
 function M.parse_remote(url)
   url = (url or ''):gsub('%.git$', '')
+  -- on-prem Azure DevOps Server: a remote under the configured collection base, e.g.
+  -- https://tfs.example.com/tfs/MyCollection/<project>/_git/<repo>. The org token in the returned
+  -- key is the collection name (last path segment of the base); repo_base ignores it and uses
+  -- base_url() directly, so the key stays stable across sessions / uri reopens.
+  local base = base_url()
+  if base then
+    -- Match on the collection *path* (everything after scheme+host in the base), so both the https
+    -- and ssh (ssh://host:22/tfs/Collection/...) remote forms resolve, regardless of any `user@`.
+    local base_path = base:gsub('^https?://[^/]+', '')
+    local rest = base_path ~= '' and url:match(vim.pesc(base_path) .. '/(.+)$')
+    if rest then
+      local project, name = rest:match('^(.+)/_git/(.+)$')
+      if project then
+        return f('%s/%s/%s', base:match('([^/]+)$') or 'collection', project, name)
+      end
+    end
+  end
   -- https://dev.azure.com/org/project/_git/repo  (also https://org@dev.azure.com/...)
   local org, project, name = url:match('https?://[^/]*dev%.azure%.com/([^/]+)/([^/]+)/_git/(.+)$')
   if org then
@@ -185,13 +313,24 @@ local function load_profile()
   if cached_user then
     return
   end
-  local url = with_api('https://app.vssps.visualstudio.com/_apis/profile/profiles/me')
-  local r =
-    vim.system({ 'az', 'rest', '--method', 'get', '--url', url, '--resource', AZDO_RESOURCE }, { text = true }):wait()
-  if r.code == 0 and vim.trim(r.stdout or '') ~= '' then
-    local p = parse_or_default(r.stdout, {})
-    cached_user = p.displayName or p.emailAddress
-    cached_user_id = p.id
+  local pat = get_pat()
+  local base = base_url()
+  -- On-prem has no vssps profile api; `connectionData` returns the authenticated identity instead.
+  -- NB: this endpoint 400s if given an api-version, so request it bare.
+  local url = base and (base .. '/_apis/connectionData')
+    or with_api('https://app.vssps.visualstudio.com/_apis/profile/profiles/me')
+  local cmd, stdin = build_request('get', url, nil, pat)
+  local r = vim.system(cmd, { text = true, stdin = stdin }):wait()
+  local p, _, code = parse_response(r, pat, false)
+  if code == 0 and type(p) == 'table' then
+    if base then
+      local u = p.authenticatedUser or {}
+      cached_user = u.providerDisplayName or u.customDisplayName
+      cached_user_id = u.id
+    else
+      cached_user = p.displayName or p.emailAddress
+      cached_user_id = p.id
+    end
   end
 end
 
@@ -522,7 +661,7 @@ function M.review_pr(id, repo, action, body, cb)
   vim.validate('repo', repo, 'string')
   local uid = M.get_user_id()
   if not uid then
-    return cb(false, 'Not logged in to az (run: az login)')
+    return cb(false, 'Not authenticated (run `az login`, or set a PAT via setup{ pat = … } / $AZDO_PAT)')
   end
   local vote = (action == 'approve' and 10) or (action == 'request-changes' and -10) or 0
   local function set_vote()
@@ -581,6 +720,39 @@ function M.update_pr(id, repo, fields, cb)
   az_rest('patch', with_api(f('%s/pullRequests/%s', repo_base(repo), id)), fields, function(_, stderr, code)
     cb(code == 0, stderr or '')
   end)
+end
+
+--- Creates a PR from `source` -> `target` branch (short names, no `refs/heads/`).
+--- The source branch must already be pushed to the remote, or the API rejects it.
+--- @param cb fun(id: integer?, stderr: string) `id` is the new pullRequestId on success.
+function M.create_pr(repo, source, target, title, description, cb)
+  vim.validate('repo', repo, 'string')
+  local body = {
+    sourceRefName = 'refs/heads/' .. source,
+    targetRefName = 'refs/heads/' .. target,
+    title = title,
+    description = description,
+  }
+  az_rest('post', with_api(f('%s/pullRequests', repo_base(repo))), body, function(resp, stderr, code)
+    if code ~= 0 or not resp or not resp.pullRequestId then
+      return cb(nil, stderr or 'failed to create PR')
+    end
+    cb(resp.pullRequestId, '')
+  end)
+end
+
+--- Human-facing web url for a PR (public wrapper around the internal builder).
+--- @return string
+function M.pr_web_url(repo, id)
+  return pr_web_url(repo, id)
+end
+
+--- Human-facing web url for a work item. Project-scoped, so it respects on-prem
+--- `azdo_base_url` (the repo segment is unused). `repo` is "org/project/<anything>".
+--- @return string
+function M.wi_web_url(repo, id)
+  local org, project = parse_repo(repo)
+  return f('%s/%s/_workitems/edit/%s', collection_base(org), urlencode(project), id)
 end
 
 ---------------------------------------------------------------------------
@@ -653,6 +825,120 @@ function M.get_workitem(repo, id, cb)
   end)
 end
 
+--- Batch-fetches display fields for up to 200 work-item ids. `errorPolicy=omit` so a
+--- since-deleted id drops out instead of failing the whole batch (tagged items may vanish).
+--- @param ids integer[]
+--- @param cb fun(items?: {id:integer, title:string, type:string, state:string}[], err?: string)
+local function fetch_workitem_fields(repo, ids, cb)
+  if #ids == 0 then
+    return cb({})
+  end
+  local capped = {}
+  for i = 1, math.min(#ids, 200) do
+    capped[i] = ids[i]
+  end
+  local extra = ('ids=%s&fields=System.Id,System.Title,System.WorkItemType,System.State,System.AssignedTo&errorPolicy=omit'):format(
+    table.concat(capped, ',')
+  )
+  az_rest('get', with_api(f('%s/wit/workitems', project_base(repo)), extra), nil, function(batch, berr, bcode)
+    if bcode ~= 0 or not batch then
+      return cb(nil, berr or 'failed to load work items')
+    end
+    local items = {}
+    for _, wi in ipairs(batch.value or {}) do
+      local fld = wi.fields or {}
+      local a = fld['System.AssignedTo']
+      items[#items + 1] = {
+        id = wi.id,
+        title = fld['System.Title'] or '',
+        type = fld['System.WorkItemType'] or 'Work Item',
+        state = fld['System.State'] or '',
+        assignee = (type(a) == 'table' and (a.displayName or a.uniqueName)) or a or 'Unassigned',
+      }
+    end
+    cb(items)
+  end)
+end
+
+--- Updates work-item fields via a JSON-patch PATCH. `fields` is a map of
+--- reference-name -> value (HTML for rich-text fields, plain string for others).
+--- A no-op (empty `fields`) succeeds without a request.
+--- @param fields table<string, string>
+--- @param cb fun(ok: boolean, stderr: string)
+function M.update_workitem(repo, id, fields, cb)
+  local patch = {}
+  for ref, val in pairs(fields) do
+    patch[#patch + 1] = { op = 'add', path = '/fields/' .. ref, value = val }
+  end
+  if #patch == 0 then
+    return cb(true, '')
+  end
+  local url = with_api(f('%s/wit/workItems/%s', project_base(repo), id))
+  az_rest('patch', url, patch, function(_, perr, pcode)
+    cb(pcode == 0, perr or '')
+  end, 'application/json-patch+json')
+end
+
+--- Fetches display fields for an explicit list of work-item ids (e.g. tagged items).
+--- @param ids integer[]
+--- @param cb fun(items?: {id:integer, title:string, type:string, state:string}[], err?: string)
+function M.get_workitems(repo, ids, cb)
+  fetch_workitem_fields(repo, ids, cb)
+end
+
+--- Lists work items assigned to the authenticated user (active, not Closed/Removed),
+--- newest-changed first. Runs a WIQL query for ids, then a batch fetch for display fields.
+--- @param cb fun(items?: {id:integer, title:string, type:string, state:string}[], err?: string)
+function M.list_my_workitems(repo, cb)
+  local wiql = {
+    query = "SELECT [System.Id] FROM WorkItems WHERE [System.AssignedTo] = @Me "
+      .. "AND [System.State] <> 'Closed' AND [System.State] <> 'Removed' "
+      .. 'ORDER BY [System.ChangedDate] DESC',
+  }
+  az_rest('post', with_api(f('%s/wit/wiql', project_base(repo))), wiql, function(resp, stderr, code)
+    if code ~= 0 or not resp then
+      return cb(nil, stderr or 'WIQL query failed')
+    end
+    local ids = {}
+    for _, w in ipairs(resp.workItems or {}) do
+      ids[#ids + 1] = w.id
+      if #ids >= 200 then -- `ids=` batch fetch caps at 200
+        break
+      end
+    end
+    fetch_workitem_fields(repo, ids, cb)
+  end)
+end
+
+--- Links work item `wi_id` to PR `pr_id` by adding an ArtifactLink relation to the work item.
+--- The PR's project/repo GUIDs (needed for the `vstfs://` artifact URI) are read from PR detail.
+--- @param cb fun(ok: boolean, stderr: string)
+function M.link_workitem(repo, pr_id, wi_id, cb)
+  az_rest('get', with_api(f('%s/pullRequests/%s', repo_base(repo), pr_id)), nil, function(detail, stderr, code)
+    if code ~= 0 or not detail or not detail.repository then
+      return cb(false, stderr or 'failed to load PR')
+    end
+    local repo_guid = detail.repository.id
+    local proj_guid = (detail.repository.project or {}).id
+    if not repo_guid or not proj_guid then
+      return cb(false, 'could not resolve project/repo id from PR')
+    end
+    -- vstfs:///Git/PullRequestId/<projectGuid>%2F<repoGuid>%2F<prId> (the %2F are literal in the URI).
+    local artifact = ('vstfs:///Git/PullRequestId/%s%%2F%s%%2F%s'):format(proj_guid, repo_guid, pr_id)
+    local patch = {
+      {
+        op = 'add',
+        path = '/relations/-',
+        value = { rel = 'ArtifactLink', url = artifact, attributes = { name = 'Pull Request' } },
+      },
+    }
+    local url = with_api(f('%s/wit/workItems/%s', project_base(repo), wi_id))
+    az_rest('patch', url, patch, function(_, perr, pcode)
+      cb(pcode == 0, perr or '')
+    end, 'application/json-patch+json')
+  end)
+end
+
 ---------------------------------------------------------------------------
 -- CI / Pipelines
 ---------------------------------------------------------------------------
@@ -717,16 +1003,19 @@ function M.get_pr_ci_logs(job_id, repo, cb)
   local progress = util.new_progress_report('Loading CI log', 0)
   progress('running')
   local build_id, log_id = decode_id(job_id)
-  -- The logs endpoint returns plain text, not JSON; fetch raw via vim.system.
+  -- The logs endpoint returns plain text, not JSON; fetch raw (Accept: */*).
   local url = with_api(f('%s/build/builds/%d/logs/%d', project_base(repo), build_id, log_id))
-  util.system({ 'az', 'rest', '--method', 'get', '--url', url, '--resource', AZDO_RESOURCE }, function(raw, stderr, code)
+  local pat = get_pat()
+  local cmd, stdin = build_request('get', url, nil, pat, true)
+  vim.system(cmd, { text = true, stdin = stdin }, vim.schedule_wrap(function(r)
+    local raw, stderr, code = parse_response(r, pat, true)
     if code ~= 0 or vim.trim(raw or '') == '' then
       progress('failed')
-      return cb(nil, vim.trim(stderr or 'log unavailable'))
+      return cb(nil, vim.trim(stderr ~= '' and stderr or 'log unavailable'))
     end
     progress('success')
     cb(vim.trim(raw))
-  end)
+  end))
 end
 
 return M

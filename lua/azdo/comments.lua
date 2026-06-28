@@ -138,6 +138,12 @@ function M.show_pr_comments(id, repo, diff_win, comments_list, viewed, n_files, 
   if not state.try_show('prcomments', repo, id) then
     -- TODO: should state.init_buf() handle this? maybe helpful for <mods> handling on :Azdo too?
     vim.cmd [[botright vertical split]]
+    -- Width of the comments split. `comments_width` is a percentage (1–99) of
+    -- the editor width; unset/invalid leaves Vim's 50% default.
+    local pct = tonumber(require('azdo.config').options.comments_width)
+    if pct and pct > 0 and pct < 100 then
+      vim.api.nvim_win_set_width(0, math.floor(vim.o.columns * pct / 100))
+    end
   end
   local buf = state.init_buf('prcomments', true, repo, id)
   util.set_default_keymaps(buf)
@@ -674,6 +680,57 @@ function M.update_comment(linenr)
       end)
     end)
   end)
+end
+
+--- Jumps the cursor to the next/previous comment-thread anchor.
+---
+--- Comment threads are tracked as `diag_ns` diagnostics on the *prdiff* buffer.
+--- The prdiff and prcomments windows are line-aligned (scrollbind), so the same
+--- row maps to the same comment in either pane — we just move the cursor in the
+--- current window and let scrollbind align the other. Wraps around at the ends.
+---
+--- @param delta integer +1 for next, -1 for previous.
+function M.goto_comment(delta)
+  local b = vim.b.azdo or {}
+  local diff_buf = b.feat == 'prdiff' and vim.api.nvim_get_current_buf()
+    or (b.repo and b.id and require('azdo.state').get_buf('prdiff', b.repo, b.id, false))
+  if not diff_buf then
+    return util.msg('No PR diff open (press dd to open the diff + comments)')
+  end
+
+  local seen, lnums = {}, {}
+  for _, d in ipairs(vim.diagnostic.get(diff_buf, { namespace = diag_ns })) do
+    if not seen[d.lnum] then
+      seen[d.lnum] = true
+      table.insert(lnums, d.lnum) -- 0-indexed buffer row
+    end
+  end
+  if #lnums == 0 then
+    return util.msg('No comments in this PR')
+  end
+  table.sort(lnums)
+
+  local cur = vim.api.nvim_win_get_cursor(0)[1] - 1 -- 0-indexed
+  local target
+  if delta > 0 then
+    for _, l in ipairs(lnums) do
+      if l > cur then
+        target = l
+        break
+      end
+    end
+    target = target or lnums[1] -- wrap to first
+  else
+    for i = #lnums, 1, -1 do
+      if lnums[i] < cur then
+        target = lnums[i]
+        break
+      end
+    end
+    target = target or lnums[#lnums] -- wrap to last
+  end
+  vim.api.nvim_win_set_cursor(0, { target + 1, 0 })
+  vim.cmd('normal! zz')
 end
 
 --- Acts on a comment thread (Reply or Resolve).

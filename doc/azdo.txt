@@ -24,17 +24,121 @@ Requirements:
 - (Optional) For highlighting diffs, use a plugin such as: https://github.com/barrettruth/diffs.nvim
 
 Auth uses your `az login` session; every REST call passes the Azure DevOps
-`--resource` audience. No PAT is required.
+`--resource` audience. No PAT is required for cloud. For on-prem Azure DevOps
+Server (TFS) or PAT auth, see |azdo-config| (the `pat` and `base_url` options).
 
-Install: >lua
+Install (lazy.nvim): >lua
+  { 'https://github.com/<you>/azdo.nvim', opts = {} }
+<
+Install (vim.pack): >lua
   vim.pack.add{ 'https://github.com/<you>/azdo.nvim' }
+  require('azdo').setup{}
+<
+
+==============================================================================
+CONFIGURATION                                                     *azdo-config*
+
+Configure Azdo by calling its setup() function (lazy.nvim's `opts` does this
+for you). All options are optional; the defaults target cloud Azure DevOps.
+>lua
+  require('azdo').setup({
+    base_url          = nil,    -- on-prem collection root; nil = cloud
+    api_version       = '7.1',  -- REST api-version
+    pat               = nil,    -- PAT string, or a function returning one
+    project           = nil,    -- default "org/project" for :Azdo items
+    create_in_tab     = true,   -- open a new PR in a new tab
+    comments_width    = nil,    -- comments split width, % of editor (1-99)
+    debug             = false,  -- log REST calls to stdpath('log')/azdo.log
+    workitem_sections = { … },  -- editable work-item sections, per type
+    keymaps           = { … },  -- buffer-local default keys, per action
+    menu              = nil,    -- key for the :AzdoMenu palette, e.g. '<leader>a'
+  })
+<
+                                                              *azdo-config-pat*
+`pat`         (string|function|nil) Personal Access Token. When set, Azdo
+              authenticates with the PAT (HTTP Basic) instead of `az login`. May
+              be a function returning the token (e.g. to read it from a
+              keychain). Also read from `$AZDO_PAT` / `$AZURE_DEVOPS_EXT_PAT`.
+              Needs "Code (read & write)" scope, plus "Build (read)" for the
+              CI-logs view. Required for on-prem Azure DevOps Server (TFS).
+
+`base_url`    (string|nil) On-prem collection base URL, e.g.
+              "https://tfs.example.com/tfs/MyCollection". When set, all REST
+              urls are built from it instead of cloud "https://dev.azure.com".
+
+`project`     (string|nil) Default project for the work-items dashboard, so it
+              works without a local clone. |azdo-workitems|
+              - Cloud:   "org/project"
+              - On-prem: "project" (the collection is already in `base_url`)
+
+`api_version` (string) REST API version. Default "7.1"; older on-prem servers
+              may need e.g. "6.0".
+
+`create_in_tab` (boolean) Open a newly-created PR in a new tab. Default true.
+
+`comments_width` (number|nil) Width of the PR comments split, as a percentage
+              (1-99) of the editor width. nil keeps Vim's 50% default. E.g.
+              `comments_width = 30` for a narrow comments pane. |azdo-diff|
+
+`debug`       (boolean) Log REST calls to `stdpath('log')/azdo.log`. Default
+              false.
+
+`menu`        (string|nil) If a key, maps it (normal mode) to the |:AzdoMenu|
+              command palette. nil maps nothing.
+
+                                                   *azdo-config-sections*
+`workitem_sections`
+              (table) Editable work-item sections, per type, for the work-item
+              view and `c:` editor. |azdo-workitems| A
+              `{ [type] = { {title, field}, … } }` table, where `field` is the
+              Azure reference name; "default" applies to unlisted types.
+              Overriding a type replaces that type's list (it is not spliced
+              into the default), so include the base sections you still want: >lua
+    require('azdo').setup({
+      workitem_sections = {
+        ["Product Backlog Item"] = {
+          { "Description", "System.Description" },
+          { "Acceptance Criteria", "Microsoft.VSTS.Common.AcceptanceCriteria" },
+          -- Add org-specific custom fields by their reference name, e.g.:
+          { "Technical Analysis", "MyOrg.Custom.TechnicalAnalysis" },
+        },
+      },
+    })
+<
+                                                    *azdo-config-keymaps*
+`keymaps`     (table|false) Buffer-local default mappings inside `azdo://`
+              buffers, as `{ action = lhs }`. Override one action and the rest
+              keep their defaults; set an action to `false` to drop just that
+              key, or `keymaps = false` to disable all defaults (then map the
+              `<Plug>(azdo-…)` maps yourself). The action names and default keys
+              are listed under |azdo-mappings|. Example: >lua
+    require('azdo').setup({
+      keymaps = {
+        merge = 'cm',   -- rebind "merge PR" from cM to cm
+        logs  = false,  -- drop the CI-logs key
+      },
+    })
+<
+Example (on-prem, PAT auth): >lua
+  require('azdo').setup({
+    base_url = "https://tfs.example.com/tfs/MyCollection",
+    pat      = os.getenv("AZDO_PAT"),
+    project  = "MyProject",
+  })
 <
 
 ==============================================================================
 WORKFLOW                                                           *azdo-usage*
 
-Azdo does not provide a setup() function. Instead it defines a plugin/azdo.lua
-file which Nvim automatically runs at startup. |lua-plugin-init|
+The `:Azdo*` commands and `<Plug>(azdo-…)` maps are registered at startup by
+plugin/azdo.lua (|lua-plugin-init|); `require('azdo').setup{}` only applies your
+configuration (|azdo-config|), so the commands work even before it runs.
+
+                                                                     *azdo-api*
+A Lua API mirrors the commands, for mapping directly or calling from your own
+code: `require('azdo')` exposes `setup(opts)`, `status()`, `work_items()`,
+`open(target)`, `menu()`, `create_pr()`, `merge()`, `review()`, `edit()`,
+`link()`, `web()`, and `refresh()`.
 
 To review a PR without doing a checkout in your repo:
 
@@ -42,8 +146,10 @@ To review a PR without doing a checkout in your repo:
   - Hit <Enter> or `CTRL-W<Enter>` on a PR/issue to view it.
 - Run `:Azdo [target]` to view a specific PR/issue. |azdo-commands|
   - Hit `R` to refresh the view.
+- Run `:AzdoMenu` for a command palette if you'd rather not memorize the
+  commands and mappings. |:AzdoMenu|
 - All "azdo://…" buffers have the same basic mappings. |azdo-mappings|
-- From the PR view, hit `dd` to see the diff. |azdo-diff|
+- From the PR view, hit `dd` to toggle the diff. |azdo-diff|
 - PR comments are loaded:
   - in a 'scrollbind' split window next to the diff window (if the
     scrollbind gets out of sync, try |:syncbind|).
@@ -77,14 +183,17 @@ Default mappings (local to `azdo://` buffers):
 - Buffer-relative VIEW actions:
   - `R` Refresh the current `azdo://` buffer.
     <Plug>(azdo-refresh)
-  - `dd` View PR diff + comments. |azdo-diff|
-    <Plug>(azdo-diff)
+  - `dd` Toggle PR diff + comments. |azdo-diff|
+    <Plug>(azdo-diff-toggle)
+    (<Plug>(azdo-diff) opens/refreshes the diff without toggling it off.)
   - `dl` View the most-recent CI logs for all job-names in the CI matrix.
     <Plug>(azdo-logs)
   - `]f` View the next PR commit (from the most-recent push).
     <Plug>(azdo-next-commit)
   - `[f` View the previous PR commit (from the most-recent push).
     <Plug>(azdo-prev-commit)
+  - `gw` Open this PR/work-item in the web browser.
+    <Plug>(azdo-web)
   - `g?` View this help section.
     <Plug>(azdo-help)
 - Buffer-relative UPDATE actions:
@@ -94,8 +203,10 @@ Default mappings (local to `azdo://` buffers):
     <Plug>(azdo-merge)
   - `cR` Review PR: approve / comment / request-changes (sets reviewer vote).
     <Plug>(azdo-review)
-  - `c:` Edit PR title/description (work items open in the browser).
+  - `c:` Edit PR title/description, or a work item's sections. |azdo-workitems|
     <Plug>(azdo-edit)
+  - `gW` Link a work item assigned to you to this PR. |:AzdoLink|
+    <Plug>(azdo-link)
 - Cursor-relative actions:
   - `<Enter>` invokes |:Azdo| on the |WORD| at cursor.
     <Plug>(azdo-open)
@@ -107,12 +218,19 @@ Default mappings (local to `azdo://` buffers):
   - `cr` (or `c` in Visual mode): Reply-to/Resolve a thread. |azdo-comment|
     In a `azdo://…/prcomments/` buffer, acts upon thread at cursor.
     <Plug>(azdo-comment)
+  - `t` Tag/untag a work item (a local "pin"). |azdo-workitems|
+    In the work-items dashboard, acts on the `#id` under the cursor; in a
+    work-item view, acts on that item.
+    <Plug>(azdo-tag-toggle)
 
 
 ------------------------------------------------------------------------------
 View PR diff                                                        *azdo-diff*
 
-`dd` on a PR view opens the diff + comments in 'scrollbind' split windows.
+`dd` on a PR view toggles the diff + comments in 'scrollbind' split windows:
+press it to open them, press it again to close the comments split and return to
+the PR overview. (<Plug>(azdo-diff) always opens/refreshes; <Plug>(azdo-diff-toggle),
+bound to `dd`, toggles.)
 
 - OUTDATED diffs (if any) are shown as extra diff section above the "current"
   diff, if any UNRESOLVED comments are anchored thereto.
@@ -220,6 +338,9 @@ Hit <Enter> or `CTRL-W<Enter>` on a `#id` to view that PR. |azdo-mappings|
 A numeric [target] is probed: an existing PR id opens the PR; otherwise it is
 treated as a work-item id.
 
+[target] "items" (or "mine" / "workitems") opens the work-items dashboard for
+the items assigned to you. |azdo-workitems|
+
 With [target]: views or refreshes the PR, work-item, commit, or repo-status:
 - PR or work-item number (current repo): `:Azdo 42`
 - Commit SHA (current repo): `:Azdo a1b2c3d`
@@ -256,6 +377,95 @@ Use bang "!" with a single-line [range] to delete a comment: >
     :.AzdoComment!
 <
 
+:AzdoCreate                                                       *:AzdoCreate*
+
+Creates a PR. Prompts for the source branch (defaults to the current branch)
+and the target branch (defaults to the remote's HEAD branch, else "main") --
+both with <Tab> completion over local + remote branches. Then opens an editor
+with the title prefilled from the source branch's tip commit subject and an
+empty description: first line = title, rest = description. ZZ creates the PR
+(ZQ aborts). The source branch must already be pushed.
+
+On success the new PR's diff view opens in a new tab; set
+`create_in_tab = false` in setup() to open it in the current window instead.
+
+:AzdoLink                                                           *:AzdoLink*
+
+From a PR buffer, links a work item assigned to you to the current PR. Lists
+your active assigned work items (WIQL `[System.AssignedTo] = @Me`) and links
+the chosen one. Also bound to `gW`. |azdo-mappings|
+
+:AzdoMenu                                                           *:AzdoMenu*
+
+Opens a command palette: a |vim.ui.select()| launcher for azdo.nvim's top-level
+entry points (status, work items, create PR, open-by-target), so you don't have
+to remember command names. The same list is shown everywhere — it's a launcher,
+not a per-buffer keymap list (use `g?` inside an `azdo://` buffer for that).
+
+Because it routes through |vim.ui.select()|, whatever picker you have wired to
+it (Telescope, fzf-lua, snacks, or the builtin) renders the palette — no extra
+config needed. Bind it for quick access, e.g.: >lua
+
+    vim.keymap.set('n', '<leader>a', '<Plug>(azdo-menu)')
+<
+                                                                  *azdo-menu-api*
+For a custom picker (e.g. a Telescope previewer that shows each action's blurb)
+the action list behind `:AzdoMenu` is exposed as a small module: >lua
+
+    local menu = require('azdo.menu')
+    menu.available()   --> the palette actions, each a { id, label, desc, run }
+    menu.exec(action)  --  run one
+<
+==============================================================================
+WORK ITEMS                                                     *azdo-workitems*
+
+Dashboard ~
+
+`:Azdo items` opens a dashboard of the work items assigned to you (`items`,
+`mine`, and `workitems` are all accepted). It runs the WIQL query
+`[System.AssignedTo] = @Me`, active (not Closed/Removed), newest-changed first.
+|<mods>| work, e.g. `:vertical Azdo items`.
+
+The dashboard needs only a project, not a repo. It is resolved from, in order:
+the `project` option, the current `azdo://` buffer's repo, then the |current-
+directory|'s clone. Set `project` (|azdo-config|) to run `:Azdo items` anywhere.
+
+Each dashboard line shows `#id  [type/state]  title  — assignee`.
+
+Hit <Enter> (or `CTRL-W<Enter>`) on a `#id` to open that work item. The view
+is rendered from the REST API (`pat` / `base_url` aware) as
+markdown: title, metadata, and one `##` section per editable field for the
+work-item type (HTML converted to markdown; empty fields show "(empty)").
+`gw` opens it in the browser.
+
+Editing ~
+
+Put the cursor in a section (under its `## <header>`, or the title area) and hit
+`c:`. |<Plug>(azdo-edit)| That opens an editable, multi-line buffer for just
+that one field, prefilled with its current value as markdown. Edit, then `ZZ`
+to save (`ZQ` to abort), exactly like comment/PR compose. |azdo-confirm|
+
+On save the field is converted markdown -> HTML (the title is saved as plain
+text) and PATCHed on its own; every other field is left untouched, so existing
+rich formatting elsewhere on the item is preserved.
+
+The sections shown depend on the work-item type. Defaults:
+- Product Backlog Item / Task / etc.: Description, Acceptance Criteria.
+- Bug: Repro Steps, System Info, Acceptance Criteria.
+Add org-specific custom fields per type with `workitem_sections`. |azdo-config-sections|
+
+Tagging (pinning) ~
+
+Press `t` to tag/untag a work item — on the `#id` under the cursor in the
+dashboard, or on the item in a work-item view. |<Plug>(azdo-tag-toggle)|
+
+Tagged items appear in a "★ Tagged" section at the top of the dashboard. A
+tagged item is fetched by id, so it shows even when it is closed or assigned
+to someone else. Tags are local, persisted across sessions, and keyed per
+project (so each project shows its own pins):
+>
+    stdpath('data')/azdo/tags.json
+<
 ==============================================================================
 HIGHLIGHTS                                                    *azdo-highlights*
 
@@ -274,7 +484,7 @@ DEVELOPMENT                                                          *azdo-dev*
 
 Enable debug logging: >lua
 
-    vim.g.azdo_debug = true
+    require('azdo').setup({ debug = true })
 
 View the logs: >
 

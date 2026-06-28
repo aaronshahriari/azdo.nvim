@@ -31,6 +31,10 @@ Also accepts an Azure DevOps URL, an `org/project/repo#42` slug, or a commit SHA
 Inside any `azdo://` buffer, press `<Enter>` to run `:Azdo` on the target at cursor. Hit `g?` to
 review the keymaps.
 
+Don't want to memorize commands? Run `:AzdoMenu` for a context-aware command palette (it routes
+through `vim.ui.select`, so your Telescope/fzf-lua/snacks picker renders it). Bind it for quick
+access, e.g. `vim.keymap.set('n', '<leader>a', '<Plug>(azdo-menu)')`.
+
 When viewing a PR:
 
 - Diff comments are presented (1) in a 'scrollbind' split, (2) as "diagnostics" (`vim.diagnostic`),
@@ -44,14 +48,42 @@ When viewing a PR:
 Editable buffers (comments, merge/complete message, PR edit) confirm on write-and-close (`ZZ`
 submits, `ZQ` discards).
 
-Keymaps are provided as `<Plug>(azdo-…)`. To customize, define a mapping to the relevant
-`<Plug>(azdo-…)` and azdo will skip its default. See the [help file](./doc/azdo.txt).
+Default keymaps are configurable via `setup({ keymaps = { merge = 'cm', … } })`, or set one to
+`false` to drop it (`keymaps = false` disables all). They're also exposed as `<Plug>(azdo-…)`
+maps — define your own mapping to one and azdo skips its default. See the [help file](./doc/azdo.txt).
 
 ## Install
 
+With [lazy.nvim](https://github.com/folke/lazy.nvim):
+
+```lua
+{ 'https://github.com/<you>/azdo.nvim', opts = {} }
+```
+
+With `vim.pack` (or any manual loader), call `setup()` yourself:
+
 ```lua
 vim.pack.add{ 'https://github.com/<you>/azdo.nvim' }
+require('azdo').setup{}
 ```
+
+### Configure
+
+`setup()` takes a single options table (all optional; defaults target cloud Azure DevOps):
+
+```lua
+require('azdo').setup({
+  base_url       = nil,    -- on-prem collection root; nil = cloud dev.azure.com
+  pat            = nil,    -- PAT string, or a function returning one; else az login
+  project        = "org/project",  -- default project for `:Azdo items`
+  comments_width = 30,     -- comments split width, % of editor width
+  menu           = "<leader>a",    -- key for the :AzdoMenu command palette
+  -- workitem_sections, keymaps, api_version, create_in_tab, debug … see :help azdo-config
+})
+```
+
+You can also map the Lua API directly: `require('azdo').status()`, `.work_items()`, `.create_pr()`,
+`.menu()`, `.merge()`, `.review()`, etc.
 
 Requirements:
 

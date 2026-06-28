@@ -9,6 +9,7 @@ vim.opt.runtimepath:append(vim.fn.fnamemodify(vim.fn.resolve(debug.getinfo(1, 'S
 
 local az = require('azdo.az')
 local util = require('azdo.util')
+local config = require('azdo.config')
 
 local n_fail = 0
 local function check(label, got, want)
@@ -28,6 +29,18 @@ check('remote org@host', az.parse_remote('https://myorg@dev.azure.com/myorg/MyPr
 check('remote ssh', az.parse_remote('git@ssh.dev.azure.com:v3/myorg/MyProj/myrepo'), 'myorg/MyProj/myrepo')
 check('remote visualstudio.com', az.parse_remote('https://myorg.visualstudio.com/MyProj/_git/myrepo'), 'myorg/MyProj/myrepo')
 check('remote non-azure', az.parse_remote('https://github.com/owner/repo'), nil)
+
+-- parse_remote: on-prem Azure DevOps Server (base_url configured). org token = collection name.
+config.setup({ base_url = 'https://tfs.example.com/tfs/MyCollection' })
+check('remote on-prem', az.parse_remote('https://tfs.example.com/tfs/MyCollection/MyProj/_git/myrepo'), 'MyCollection/MyProj/myrepo')
+check('remote on-prem .git', az.parse_remote('https://tfs.example.com/tfs/MyCollection/MyProj/_git/myrepo.git'), 'MyCollection/MyProj/myrepo')
+check('remote on-prem user@host', az.parse_remote('https://me@tfs.example.com/tfs/MyCollection/MyProj/_git/myrepo'), 'MyCollection/MyProj/myrepo')
+check('remote on-prem ssh', az.parse_remote('ssh://tfs.example.com:22/tfs/MyCollection/MyProj/_git/myrepo'), 'MyCollection/MyProj/myrepo')
+config.setup({ base_url = 'https://tfs.example.com/tfs/MyCollection/' }) -- trailing slash tolerated
+check('remote on-prem trailing /', az.parse_remote('https://tfs.example.com/tfs/MyCollection/MyProj/_git/myrepo'), 'MyCollection/MyProj/myrepo')
+config.setup({}) -- reset to defaults (base_url = nil)
+-- cloud parsing still works once the on-prem base is unset
+check('remote cloud after on-prem', az.parse_remote('https://dev.azure.com/myorg/MyProj/_git/myrepo'), 'myorg/MyProj/myrepo')
 
 -- parse_target: URLs, azdo:// URIs, slugs, bare ids/shas.
 local pt = util.parse_target

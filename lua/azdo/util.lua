@@ -1,4 +1,5 @@
 local state = require('azdo.state')
+local config = require('azdo.config')
 
 local M = {}
 
@@ -152,13 +153,13 @@ function M.is_empty(value)
   return value == nil or value == '' or value == 0 or #value == 0
 end
 
---- Appends a debug log entry to `stdpath('log')/azdo.log` when
---- `vim.g.azdo_debug` is true. No-op otherwise.
+--- Appends a debug log entry to `stdpath('log')/azdo.log` when the `debug`
+--- option is true. No-op otherwise.
 ---
 --- @param key string
 --- @param message any
 function M.log(key, message)
-  if not vim.g.azdo_debug then
+  if not config.options.debug then
     return
   end
   local log_file_name = vim.fn.stdpath('log') .. '/azdo.log'
@@ -283,27 +284,82 @@ end
 --- These defaults are shared across all `azdo://*` views (status, PR, issue, prdiff, prcomments).
 ---
 --- @param buf integer
-function M.set_default_keymaps(buf)
+--- Static wiring for the default buffer mappings: each action's mode, the
+--- `<Plug>` it fires, its description, extra keymap opts, and (optionally) the
+--- `azdo://` features it applies to. The *keys* are configurable — they come
+--- from `config.options.keymaps[name]` — but the plug/desc are fixed here.
+--- `feats = nil` means "all features".
+local KEYMAP_SPEC = {
   -- "Global" (buffer-relative) VIEW actions:
-  M.map_default(buf, 'n', 'R', '<Plug>(azdo-refresh)', 'Refresh this azdo:// buffer')
-  M.map_default(buf, 'n', 'dd', '<Plug>(azdo-diff)', 'View the PR diff')
-  M.map_default(buf, 'n', 'dl', '<Plug>(azdo-logs)', 'View the CI logs for this PR')
-  M.map_default(buf, 'n', ']f', '<Plug>(azdo-next-commit)', 'View the next PR commit')
-  M.map_default(buf, 'n', '[f', '<Plug>(azdo-prev-commit)', 'View the previous PR commit')
-  M.map_default(buf, 'n', 'g?', '<Plug>(azdo-help)', 'Show azdo-mappings help', { nowait = true })
+  { name = 'refresh', plug = '<Plug>(azdo-refresh)', desc = 'Refresh this azdo:// buffer' },
+  { name = 'diff_toggle', plug = '<Plug>(azdo-diff-toggle)', desc = 'Toggle the PR diff + comments split' },
+  { name = 'logs', plug = '<Plug>(azdo-logs)', desc = 'View the CI logs for this PR' },
+  { name = 'next_commit', plug = '<Plug>(azdo-next-commit)', desc = 'View the next PR commit' },
+  { name = 'prev_commit', plug = '<Plug>(azdo-prev-commit)', desc = 'View the previous PR commit' },
+  { name = 'web', plug = '<Plug>(azdo-web)', desc = 'Open this PR/work-item in the web browser' },
+  { name = 'link', plug = '<Plug>(azdo-link)', desc = 'Link a work item (assigned to you) to this PR' },
+  { name = 'help', plug = '<Plug>(azdo-help)', desc = 'Show azdo-mappings help', extra = { nowait = true } },
 
   -- "Global" (buffer-relative) UPDATE actions:
-  M.map_default(buf, 'n', 'cC', '<Plug>(azdo-comment-overview)', 'Comment on PR/issue overview')
-  M.map_default(buf, 'n', 'cM', '<Plug>(azdo-merge)', 'Merge PR')
-  M.map_default(buf, 'n', 'cR', '<Plug>(azdo-review)', 'Review PR (approve/request-changes/comment)')
-  M.map_default(buf, 'n', 'c:', '<Plug>(azdo-edit)', 'Edit PR/issue properties (az repos pr update, az boards work-item update)')
+  { name = 'comment_overview', plug = '<Plug>(azdo-comment-overview)', desc = 'Comment on PR/issue overview' },
+  { name = 'merge', plug = '<Plug>(azdo-merge)', desc = 'Merge PR' },
+  { name = 'review', plug = '<Plug>(azdo-review)', desc = 'Review PR (approve/request-changes/comment)' },
+  {
+    name = 'edit',
+    plug = '<Plug>(azdo-edit)',
+    desc = 'Edit PR/issue properties (az repos pr update, az boards work-item update)',
+  },
 
   -- "Local" (cursor-relative) actions:
-  M.map_default(buf, 'n', 'cc', '<Plug>(azdo-comment)', 'Comment on PR or diff')
-  M.map_default(buf, 'x', 'c', '<Plug>(azdo-comment)', 'Comment on PR or diff')
-  M.map_default(buf, 'n', 'cr', '<Plug>(azdo-thread)', 'Reply-to or Resolve a comment thread')
-  M.map_default(buf, 'n', '<Enter>', '<Plug>(azdo-open)', 'Open :Azdo target at cursor')
-  M.map_default(buf, 'n', '<C-W><Enter>', '<Plug>(azdo-open-split)', 'Open :Azdo target at cursor in a split')
+  { name = 'comment', plug = '<Plug>(azdo-comment)', desc = 'Comment on PR or diff' },
+  { name = 'comment_visual', mode = 'x', plug = '<Plug>(azdo-comment)', desc = 'Comment on PR or diff' },
+  { name = 'thread', plug = '<Plug>(azdo-thread)', desc = 'Reply-to or Resolve a comment thread' },
+  { name = 'comment_delete', plug = '<Plug>(azdo-comment-delete)', desc = 'Delete a comment (prompts to confirm)' },
+  { name = 'comment_update', plug = '<Plug>(azdo-comment-update)', desc = 'Update/edit a comment' },
+  { name = 'open', plug = '<Plug>(azdo-open)', desc = 'Open :Azdo target at cursor' },
+  { name = 'open_split', plug = '<Plug>(azdo-open-split)', desc = 'Open :Azdo target at cursor in a split' },
+
+  -- Comment-thread navigation: only useful in the diff + comments panes, where
+  -- threads are anchored. (Both panes are line-aligned, so this works in either.)
+  {
+    name = 'next_comment',
+    plug = '<Plug>(azdo-next-comment)',
+    desc = 'Jump to next comment thread',
+    feats = { prdiff = true, prcomments = true },
+  },
+  {
+    name = 'prev_comment',
+    plug = '<Plug>(azdo-prev-comment)',
+    desc = 'Jump to previous comment thread',
+    feats = { prdiff = true, prcomments = true },
+  },
+
+  -- Work-items dashboard only:
+  {
+    name = 'tag_toggle',
+    plug = '<Plug>(azdo-tag-toggle)',
+    desc = 'Tag/untag the work item under the cursor',
+    feats = { workitems = true },
+  },
+}
+
+--- Defines the buffer-local default mappings for this `azdo://` buffer, reading
+--- the per-action keys from `config.options.keymaps`. Skipped entirely when
+--- `keymaps = false`; a single action with a falsey/empty key is skipped too.
+function M.set_default_keymaps(buf)
+  local keymaps = config.options.keymaps
+  if keymaps == false or keymaps == nil then
+    return
+  end
+  local feat = (vim.b[buf].azdo or {}).feat
+  for _, spec in ipairs(KEYMAP_SPEC) do
+    if not spec.feats or spec.feats[feat] then
+      local lhs = keymaps[spec.name]
+      if type(lhs) == 'string' and lhs ~= '' then
+        M.map_default(buf, spec.mode or 'n', lhs, spec.plug, spec.desc, spec.extra)
+      end
+    end
+  end
 end
 
 function M.buf_keymap(buf, mode, lhs, desc, rhs)
